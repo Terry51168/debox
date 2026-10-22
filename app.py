@@ -23,26 +23,25 @@ def make_headers():
     raw = f"{APP_SECRET}{nonce}{timestamp}"
     signature = hashlib.sha1(raw.encode()).hexdigest()
     return {
-    "Content-Type": "application/json",
-    "app_id": APP_KEY,          # <--- 就是加上这一行！
-    "X-API-KEY": APP_KEY,
-    "nonce": nonce,
-    "timestamp": timestamp,
-    "signature": signature,
+        "Content-Type": "application/json",
+        "app_id": APP_KEY,
+        "X-API-KEY": APP_KEY,
+        "nonce": nonce,
+        "timestamp": timestamp,
+        "signature": signature,
     }
 
 # 发送消息到群组（带日志打印）
 def send_group_message(group_id, content):
-    url = "https://open.debox.pro/openapi/messages/group/send"
+    url = "https://open.debox.pro/openapi/messages/group/send"  # 补上了漏掉的 URL
     payload = {
         "group_id": group_id,
+        "to_user_id": "",
         "object_name": "text",
-        "content": content
+        "message": content
     }
     try:
-        # 发起请求
         resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
-        # 打印 DeBox 返回的详细结果
         print(f"==== DeBox发消息状态码: {resp.status_code} ====")
         print(f"==== DeBox发消息返回内容: {resp.text} ====")
     except Exception as e:
@@ -50,7 +49,6 @@ def send_group_message(group_id, content):
 
 # 查询代币安全信息
 def get_token_risk(ca_address):
-    # 默认查 BSC (56)，你可以根据需要修改
     url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={ca_address}"
     try:
         resp = requests.get(url, timeout=8)
@@ -86,20 +84,16 @@ def get_token_risk(ca_address):
 # Webhook 接收入口
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # 校验 Webhook 密钥
     if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
         print("==== 警告：X-API-KEY 校验失败！ ====")
         return jsonify({"error": "unauthorized"}), 401
     
     data = request.get_json(silent=True) or {}
     
-    # 打印 DeBox 发过来的原始数据，方便排查格式
-    print(f"==== 收到 DeBox 原始数据: {data} ====")
-    
-    message = data.get("message", "")
+    # 兼容处理：优先用 message_raw 拿带 @ 的文本，没有的话再用 message
+    message = data.get("message_raw", data.get("message", ""))
     group_id = data.get("group_id", "")
     
-    # 确保是群消息且有文本
     if group_id and message:
         match = CA_PATTERN.search(message)
         if match:
