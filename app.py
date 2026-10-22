@@ -23,11 +23,12 @@ def make_headers():
     raw = f"{APP_SECRET}{nonce}{timestamp}"
     signature = hashlib.sha1(raw.encode()).hexdigest()
     return {
-        "Content-Type": "application/json",
-        "X-API-KEY": APP_KEY,
-        "nonce": nonce,
-        "timestamp": timestamp,
-        "signature": signature,
+    "Content-Type": "application/json",
+    "app_id": APP_KEY,          # <--- 就是加上这一行！
+    "X-API-KEY": APP_KEY,
+    "nonce": nonce,
+    "timestamp": timestamp,
+    "signature": signature,
     }
 
 # 发送消息到群组（带日志打印）
