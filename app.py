@@ -33,20 +33,26 @@ def make_headers():
 
 # 发送消息到群组（带日志打印）
 def send_group_message(group_id, content):
-    url = "https://open.debox.pro/openapi/messages/group/send"  # 补上了漏掉的 URL
+    # 尝试使用兼容 Telegram 的标准发送接口
+    url = f"https://open.debox.pro/bot{APP_KEY}/sendMessage"
+    
+    # 兼容 Telegram 的 payload 格式
     payload = {
-        "group_id": group_id,
-        "to_user_id": "",
-        "object_name": "text",
-        "message": content
+        "chat_id": group_id,
+        "text": content
     }
+    
+    # 这里的 Header 我们改回最基础的，避免签名算法导致拒绝
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
     try:
-        resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
         print(f"==== DeBox发消息状态码: {resp.status_code} ====")
         print(f"==== DeBox发消息返回内容: {resp.text} ====")
     except Exception as e:
         print(f"==== 发送消息异常: {e} ====")
-
 # 查询代币安全信息
 def get_token_risk(ca_address):
     url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={ca_address}"
