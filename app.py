@@ -8,12 +8,15 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# 从环境变量读取配置
 APP_KEY = os.getenv("DEBOX_APP_KEY", "")
 APP_SECRET = os.getenv("DEBOX_APP_SECRET", "")
 WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 
+# 匹配 0x 开头的合约地址
 CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
 
+# 生成 API 请求签名
 def make_headers():
     nonce = str(random.randint(10000000, 99999999))
     timestamp = str(int(time.time() * 1000))
@@ -27,99 +30,92 @@ def make_headers():
         "signature": signature,
     }
 
-def get_inline_keyboard():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🐕 查风险", "callback_data": "check_risk"},
-                {"text": "📊 查持仓", "callback_data": "check_holdings"}
-            ],
-            [
-                {"text": "📜 使用说明", "callback_data": "show_help"},
-                {"text": "🔗 访问DeBox", "url": "https://debox.pro"}
-            ]
-        ]
-    }
-
-def send_card_message(group_id, text, keyboard=None):
+# 发送消息到群组（带日志打印）
+def send_group_message(group_id, content):
     url = "https://open.debox.pro/openapi/messages/group/send"
-    payload = {"group_id": group_id, "object_name": "text", "content": text}
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    
+    payload = {
+        "group_id": group_id,
+        "object_name": "text",
+        "content": content
+    }
     try:
-        # 加一个 resp 接收返回值
+        # 发起请求
         resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
-        # 打印 DeBox 到底回传了什么！
+        # 打印 DeBox 返回的详细结果
         print(f"==== DeBox发消息状态码: {resp.status_code} ====")
         print(f"==== DeBox发消息返回内容: {resp.text} ====")
     except Exception as e:
-        # 如果代码本身报错，也打印出来
-        print(f"==== 发送消息出错: {e} ====")
+        print(f"==== 发送消息异常: {e} ====")
 
-def handle_callback(callback_query_id, data, group_id):
-    if data == "check_risk":
-        reply_text = "🐕‍🦺 请输入或转发你要查询风险的合约地址（0x开头），警犬马上帮你闻一闻！"
-    elif data == "check_holdings":
-        reply_text = "📊 持仓查询功能正在开发中，很快就能上线啦！"
-    elif data == "show_help":
-        reply_text = "🐕‍🦺 我是链上警犬，专门负责群内的安全。\n\n你可以：\n1. 直接发CA给我，我帮你查风险；\n2. 点击下方按钮使用快捷功能。"
-    else:
-        reply_text = "未知指令。"
-    url = "https://open.debox.pro/openapi/messages/group/send"
-    payload = {"group_id": group_id, "object_name": "text", "content": reply_text}
-    requests.post(url, json=payload, headers=make_headers(), timeout=10)
-
+# 查询代币安全信息
 def get_token_risk(ca_address):
+    # 默认查 BSC (56)，你可以根据需要修改
     url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={ca_address}"
     try:
         resp = requests.get(url, timeout=8)
         data = resp.json()
         if data.get("code") != 1 or not data.get("result"):
             return "🐕‍🦺 嗅探失败：未找到该代币的安全数据。"
+        
         info = data["result"].get(ca_address.lower(), {})
         is_honeypot = info.get("is_honeypot", "0")
         buy_tax = info.get("buy_tax", "0")
         sell_tax = info.get("sell_tax", "0")
+        
         lines = []
         if is_honeypot == "1":
             lines.append("⚠️ 貔貅盘（无法卖出）")
         else:
             lines.append("✅ 非貔貅盘")
+            
         try:
             b_pct, s_pct = float(buy_tax)*100, float(sell_tax)*100
             if b_pct > 10 or s_pct > 10:
                 lines.append(f"⚠️ 高额税(买{b_pct:.1f}%/卖{s_pct:.1f}%)")
             else:
                 lines.append(f"交易税(买{b_pct:.1f}%/卖{s_pct:.1f}%)")
-        except: pass
+        except: 
+            pass
+        
         return f"🐕‍🦺 嗅探完毕：{'；'.join(lines[:2])}。DYOR！"
-    except Exception:
+    except Exception as e:
+        print(f"==== GoPlus查询异常: {e} ====")
         return "🐕‍🦺 网络嗅探异常，请稍后。"
 
+# Webhook 接收入口
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # 校验 Webhook 密钥
     if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
+        print("==== 警告：X-API-KEY 校验失败！ ====")
         return jsonify({"error": "unauthorized"}), 401
+    
     data = request.get_json(silent=True) or {}
-    if "callback_query" in data:
-        cb = data["callback_query"]
-        callback_id = cb.get("id")
-        cb_data = cb.get("data")
-        group_id = cb.get("message", {}).get("chat", {}).get("id")
-        if group_id and cb_data:
-            handle_callback(callback_id, cb_data, group_id)
-        return jsonify({"status": "ok"}), 200
-
+    
+    # 打印 DeBox 发过来的原始数据，方便排查格式
+    print(f"==== 收到 DeBox 原始数据: {data} ====")
+    
     message = data.get("message", "")
     group_id = data.get("group_id", "")
+    
+    # 确保是群消息且有文本
     if group_id and message:
-        if "@" in message or "菜单" in message or "help" in message.lower():
-            keyboard = get_inline_keyboard()
-            send_card_message(group_id, "🐕‍🦺 警犬已就位！请点击下方按钮，或直接发送CA给我：", keyboard)
-            return jsonify({"status": "ok"}), 200
         match = CA_PATTERN.search(message)
         if match:
-            reply_text = get_token_risk(match.group())
-            send_card_message(group_id, reply_text)
+            ca_address = match.group()
+            print(f"==== 识别到 CA 地址: {ca_address}，开始查询 ====")
+            
+            reply_text = get_token_risk(ca_address)
+            print(f"==== 准备回复内容: {reply_text} ====")
+            
+            # 发送消息
+            send_group_message(group_id, reply_text)
+        else:
+            print("==== 收到群消息，但里面没有 CA 地址 ====")
+    else:
+        print("==== 收到消息，但没有 group_id (可能是私聊或回调) ====")
+
     return jsonify({"status": "ok"}), 200
+
+# Vercel 需要的入口
+handler = app
