@@ -16,43 +16,38 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 # 匹配 0x 开头的合约地址
 CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
 
-# 生成 API 请求签名
+# 生成 API 请求签名（严格按官方文档要求）
 def make_headers():
-    nonce = str(random.randint(10000000, 99999999))
-    timestamp = str(int(time.time() * 1000))
+    nonce = str(random.randint(10000000, 99999999)) # 8位随机数
+    timestamp = str(int(time.time() * 1000))         # 毫秒级时间戳
     raw = f"{APP_SECRET}{nonce}{timestamp}"
     signature = hashlib.sha1(raw.encode()).hexdigest()
     return {
         "Content-Type": "application/json",
-        "app_id": APP_KEY,
         "X-API-KEY": APP_KEY,
         "nonce": nonce,
         "timestamp": timestamp,
         "signature": signature,
     }
 
-# 发送消息到群组（带日志打印）
+# 发送消息到群组（官方标准接口）
 def send_group_message(group_id, content):
-    # 尝试使用兼容 Telegram 的标准发送接口
-    url = f"https://open.debox.pro/bot{APP_KEY}/sendMessage"
+    url = "https://open.debox.pro/openapi/messages/group/send"
     
-    # 兼容 Telegram 的 payload 格式
+    # 严格按照官方要求，使用 content 字段
     payload = {
-        "chat_id": group_id,
-        "text": content
-    }
-    
-    # 这里的 Header 我们改回最基础的，避免签名算法导致拒绝
-    headers = {
-        "Content-Type": "application/json"
+        "group_id": group_id,
+        "object_name": "text",
+        "content": content
     }
     
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
         print(f"==== DeBox发消息状态码: {resp.status_code} ====")
         print(f"==== DeBox发消息返回内容: {resp.text} ====")
     except Exception as e:
         print(f"==== 发送消息异常: {e} ====")
+
 # 查询代币安全信息
 def get_token_risk(ca_address):
     url = f"https://api.gopluslabs.io/api/v1/token_security/56?contract_addresses={ca_address}"
