@@ -35,7 +35,7 @@ def get_token_full_info(ca_address):
     dex_chain = "bsc"
     has_dex_data = False
     
-    # 1. 尝试查行情
+    # 1. 查行情，提取全链总池子
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     try:
         res = requests.get(dex_url, timeout=5).json()
@@ -53,8 +53,8 @@ def get_token_full_info(ca_address):
     except Exception as e:
         print(f"查行情失败: {e}")
 
-    # 2. 查安全（不管有没有行情，都尝试去查安全）
-    chain_id = CHAIN_MAPPING.get(dex_chain, "56") # 默认 BSC
+    # 2. 查安全
+    chain_id = CHAIN_MAPPING.get(dex_chain, "56")
     is_dangerous = False
     risk_reasons = []
     
@@ -99,7 +99,7 @@ def get_token_full_info(ca_address):
     except Exception as e:
         safety_line_1 = "🛡️ 安全数据暂时无法获取"
 
-    # 3. 消息拼接
+    # 3. 严格按照你的格式拼接消息
     if is_dangerous:
         header = "🚨 汪汪汪！！（狂吠）报告老板，发现危险目标！\n"
         risk_text = "\n⚠️ 危险提示: " + " | ".join(risk_reasons)
@@ -121,14 +121,15 @@ def get_token_full_info(ca_address):
     else:
         final_text = (
             f"🐕‍🦺 嗅探提示：DexScreener暂未收录该币行情（极早期或流动性极低）。\n"
-            f"但我们查到了它的安全信息：\n"
+            f"💰 价格: -- | 全链总池子: --\n"
+            f"📈 24h量: --\n"
             f"{safety_line_1}\n"
             f"{safety_line_2}\n"
             f"{risk_text}\n"
             f"⚠️ DYOR！"
         )
 
-    # 4. 按钮生成（只保留产品体验群按钮）
+    # 4. 只保留产品体验群按钮
     keyboard = {
         "inline_keyboard": [
             [
