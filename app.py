@@ -46,10 +46,16 @@ def send_card_message(group_id, text, keyboard=None):
     payload = {"group_id": group_id, "object_name": "text", "content": text}
     if keyboard:
         payload["reply_markup"] = keyboard
+    
     try:
-        requests.post(url, json=payload, headers=make_headers(), timeout=10)
-    except Exception:
-        pass
+        # 加一个 resp 接收返回值
+        resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
+        # 打印 DeBox 到底回传了什么！
+        print(f"==== DeBox发消息状态码: {resp.status_code} ====")
+        print(f"==== DeBox发消息返回内容: {resp.text} ====")
+    except Exception as e:
+        # 如果代码本身报错，也打印出来
+        print(f"==== 发送消息出错: {e} ====")
 
 def handle_callback(callback_query_id, data, group_id):
     if data == "check_risk":
