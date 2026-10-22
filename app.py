@@ -1,7 +1,6 @@
 import os
 import re
 import time
-import hashlib
 import random
 import requests
 from flask import Flask, request, jsonify
@@ -10,39 +9,33 @@ app = Flask(__name__)
 
 # 从环境变量读取配置
 APP_KEY = os.getenv("DEBOX_APP_KEY", "")
-APP_SECRET = os.getenv("DEBOX_APP_SECRET", "")
+APP_SECRET = os.getenv("DEBOX_APP_SECRET", "") # 保留但新接口不用了
 WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 
 # 匹配 0x 开头的合约地址
 CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
 
-# 生成 API 请求签名（严格按官方文档要求）
-def make_headers():
-    nonce = str(random.randint(10000000, 99999999)) # 8位随机数
-    timestamp = str(int(time.time() * 1000))         # 毫秒级时间戳
-    raw = f"{APP_SECRET}{nonce}{timestamp}"
-    signature = hashlib.sha1(raw.encode()).hexdigest()
-    return {
-        "Content-Type": "application/json",
-        "X-API-KEY": APP_KEY,
-        "nonce": nonce,
-        "timestamp": timestamp,
-        "signature": signature,
-    }
-
-# 发送消息到群组（官方标准接口）
+# 发送消息到群组（按照管理员提供的最新规范修改）
 def send_group_message(group_id, content):
-    url = "https://open.debox.pro/openapi/messages/group/send"
+    # 1. URL 修改
+    url = "https://open.debox.pro/openapi/bot/sendMessage"
     
-    # 严格按照官方要求，使用 content 字段
+    # 2. 请求头只保留基础信息和 App Key
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-KEY": APP_KEY
+    }
+    
+    # 3. 请求体字段全面更新
     payload = {
-        "group_id": group_id,
-        "object_name": "text",
-        "content": content
+        "chat_id": group_id,       # 原 group_id 改为 chat_id
+        "chat_type": "group",      # 增加群类型
+        "parse_mode": "text",      # 原 object_name 改为 parse_mode
+        "content": content         # 保持不变
     }
     
     try:
-        resp = requests.post(url, json=payload, headers=make_headers(), timeout=10)
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
         print(f"==== DeBox发消息状态码: {resp.status_code} ====")
         print(f"==== DeBox发消息返回内容: {resp.text} ====")
     except Exception as e:
@@ -91,7 +84,7 @@ def webhook():
     
     data = request.get_json(silent=True) or {}
     
-    # 兼容处理：优先用 message_raw 拿带 @ 的文本，没有的话再用 message
+    # 兼容处理：优先用 message_raw 拿带 @ 的文本
     message = data.get("message_raw", data.get("message", ""))
     group_id = data.get("group_id", "")
     
