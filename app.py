@@ -118,7 +118,7 @@ def get_token_full_info(ca_address):
         pairs = []
 
     if not pairs:
-        return "🐕‍🦺 嗅探失败：没查到行情数据，可能是极早期盘、假地址，或不在已收录的链上。", None
+        return "🐕‍🦺 嗅探失败：没查到行情数据，可能是极早期盘、假地址，或不在已收录的链上。"
 
     best_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) if x.get("liquidity") else 0))
     dex_chain = best_pair.get("chainId", "bsc")
@@ -223,21 +223,13 @@ def get_token_full_info(ca_address):
 
     final_text = f"{header}📍 {chain_name} 链数据如下：\n" + "\n".join(msg_lines) + risk_text + "\n\n⚠️ DYOR！"
     
-    # 添加产品体验群按钮
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "💬 加入产品体验群", "url": "https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"}]
-        ]
-    }
-    return final_text, keyboard
+    return final_text
 
-# 保留 v1 接口
-def send_message(chat_type, chat_id, content, reply_markup=None):
+# 保留 v1 接口，不带按钮参数
+def send_message(chat_type, chat_id, content):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
     payload = {"chat_type": chat_type, "chat_id": chat_id, "content": content, "parse_mode": "text"}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
     try:
         requests.post(url, json=payload, headers=headers, timeout=10)
     except Exception as e:
@@ -258,25 +250,18 @@ def webhook():
         record_realtime_group(group_id)
 
     if message:
-        # 1. 🌟 新增：使用教程（帮助菜单）
+        # 1. 使用教程（纯文本加链接）
         if any(k in message.lower() for k in ["/help", "教程", "菜单", "说明"]):
             help_text = (
-                "🐕‍🦺 **链上警犬使用说明**\n\n"
-                "👉 **查代币安全**：直接在群内发送 `0x` 开头的合约地址（CA），警犬会立刻帮你排雷。\n"
-                "👉 **防钓鱼雷达**：群内出现不明链接，警犬会自动拦截并发出警告。\n"
-                "👉 **深度数据**：自动聚合全链池子，并检测锁仓比例与庄家控盘率。\n\n"
-                "💡 觉得好用？点击下方按钮加入产品体验群，获取最新功能！"
+                "🐕‍🦺 链上警犬使用说明\n\n"
+                "👉 查代币安全：直接在群内发送 0x 开头的合约地址（CA），警犬会立刻帮你排雷。\n"
+                "👉 防钓鱼雷达：群内出现不明链接，警犬会自动拦截并发出警告。\n"
+                "👉 深度数据：自动聚合全链池子，并检测锁仓比例与庄家控盘率。\n\n"
+                "💡 觉得好用？点击下方链接加入产品体验群，获取最新功能！\n"
+                "🔗 体验群链接：https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"
             )
-            # 附带加群按钮
-            help_keyboard = {
-                "inline_keyboard": [
-                    [{"text": "💬 加入产品体验群", "url": "https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"}]
-                ]
-            }
-            if group_id: 
-                send_message("group", group_id, help_text, help_keyboard)
-            elif from_user_id: 
-                send_message("private", from_user_id, help_text, help_keyboard)
+            if group_id: send_message("group", group_id, help_text)
+            elif from_user_id: send_message("private", from_user_id, help_text)
             return jsonify({"status": "ok"}), 200
 
         # 2. 管理员查后台
@@ -284,11 +269,11 @@ def webhook():
             if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
                 stats = get_usage_stats()
                 admin_msg = (
-                    f"📊 **链上警犬 · 实时运营看板**\n\n"
-                    f"👥 **服务群组 (实时)**: {stats['total_groups']} 个\n"
-                    f"🔍 **累计查币次数**: {stats['total_queries']:,} 次\n"
-                    f"🧑‍💻 **累计独立用户**: {stats['total_users']:,} 人\n\n"
-                    f"📈 **活跃用户环比** (日/周/月):\n"
+                    f"📊 链上警犬 · 实时运营看板\n\n"
+                    f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
+                    f"🔍 累计查币次数: {stats['total_queries']:,} 次\n"
+                    f"🧑‍💻 累计独立用户: {stats['total_users']:,} 人\n\n"
+                    f"📈 活跃用户环比 (日/周/月):\n"
                     f"🔸 今日: {stats['daily_str']}\n"
                     f"🔸 本周: {stats['weekly_str']}\n"
                     f"🔸 本月: {stats['monthly_str']}\n\n"
@@ -304,9 +289,9 @@ def webhook():
         match_ca = CA_PATTERN.search(message)
         if match_ca:
             ca_address = match_ca.group()
-            reply_text, keyboard = get_token_full_info(ca_address)
-            if group_id: send_message("group", group_id, reply_text, keyboard)
-            elif from_user_id: send_message("private", from_user_id, reply_text, keyboard)
+            reply_text = get_token_full_info(ca_address)
+            if group_id: send_message("group", group_id, reply_text)
+            elif from_user_id: send_message("private", from_user_id, reply_text)
             
             record_user_activity(from_user_id)
             return jsonify({"status": "ok"}), 200
@@ -320,7 +305,7 @@ def webhook():
                 allowed_domains = ["twitter.com", "x.com", "debox.pro"]
                 is_safe = any(domain == d or domain.endswith("." + d) for d in allowed_domains)
                 if not is_safe:
-                    reply_text = f"🐕 警告：嗅探到不明链接！\n\n🌐 域名: `{domain}`\n警犬闻到了钓鱼的风险，请群友警惕，不要随意点击授权钱包！"
+                    reply_text = f"🐕 警告：嗅探到不明链接！\n\n🌐 域名: {domain}\n警犬闻到了钓鱼的风险，请群友警惕，不要随意点击授权钱包！"
                     send_message("group", group_id, reply_text)
             except: pass
 
