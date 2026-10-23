@@ -14,7 +14,7 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 # 数据后台配置
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-ADMIN_USER_ID = "51168" 
+ADMIN_USER_ID = "9410sfdk" 
 
 CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
