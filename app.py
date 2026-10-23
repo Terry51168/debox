@@ -15,10 +15,13 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# ⚠️ 你的专属管理员 ID (已修改为真实的 9410sfdk)
-ADMIN_USER_ID = "9410sfdk" 
+# ⚠️ 你的专属管理员 ID
+ADMIN_USER_ID = "9410sfdk"
 
-CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
+# ===== 地址正则：同时支持 EVM 与 Solana =====
+# EVM: 0x + 40位hex
+# Solana: Base58 字符集 32-44 位（不含 0 O I l）
+CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
 
 CHAIN_MAPPING = {
@@ -32,9 +35,43 @@ CHAIN_NAMES = {
     "10": "OP"
 }
 
+# Base58 字符集（用于 Solana 地址严格校验）
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def is_valid_solana_address(addr):
+    """
+    严格校验 Solana 地址：
+    - 长度 32–44
+    - 全部字符属于 Base58 字符集
+    - Base58 解码后字节长度恰好为 32
+    """
+    if not isinstance(addr, str) or not (32 <= len(addr) <= 44):
+        return False
+    num = 0
+    try:
+        for ch in addr:
+            num = num * 58 + BASE58_ALPHABET.index(ch)
+    except ValueError:
+        return False
+    # 前导 '1' 代表前导零字节
+    leading_zeros = 0
+    for ch in addr:
+        if ch == '1':
+            leading_zeros += 1
+        else:
+            break
+    if num == 0:
+        byte_len = leading_zeros
+    else:
+        byte_len = leading_zeros + (num.bit_length() + 7) // 8
+    return byte_len == 32
+
+
 # 获取北京时间的函数
 def get_beijing_time():
     return datetime.utcnow() + timedelta(hours=8)
+
 
 def fmt_money(n):
     try:
@@ -45,12 +82,14 @@ def fmt_money(n):
     except:
         return "$0.00"
 
+
 # ================= 运营数据统计系统 =================
 def record_realtime_group(group_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not group_id: return
     try:
         requests.get(f"{UPSTASH_URL}/sadd/all_groups/{group_id}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3)
     except: pass
+
 
 def record_user_activity(user_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not user_id: return
@@ -68,6 +107,7 @@ def record_user_activity(user_id):
         requests.get(f"{UPSTASH_URL}/sadd/active_monthly_{month_str}/{user_id}", headers=headers, timeout=3)
     except: pass
 
+
 def get_cardinality(key):
     if not UPSTASH_URL: return 0
     try:
@@ -75,11 +115,13 @@ def get_cardinality(key):
         return res.get("result", 0)
     except: return 0
 
+
 def calc_growth(current, previous):
     if previous == 0: return "🟢 +100%" if current > 0 else "0%"
     growth = ((current - previous) / previous) * 100
     icon = "🟢 +" if growth >= 0 else "🔴 "
     return f"{icon}{growth:.1f}%"
+
 
 def get_usage_stats():
     now = get_beijing_time()
@@ -89,7 +131,7 @@ def get_usage_stats():
     last_week = (now - timedelta(days=now.weekday() + 7)).strftime("%Y%m%d")
     this_month = now.strftime("%Y%m")
     last_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y%m")
-    
+
     stats = {}
     stats["total_groups"] = get_cardinality("all_groups")
     stats["total_users"] = get_cardinality("all_users")
@@ -104,16 +146,26 @@ def get_usage_stats():
     last_week_active = get_cardinality(f"active_weekly_{last_week}")
     this_month_active = get_cardinality(f"active_monthly_{this_month}")
     last_month_active = get_cardinality(f"active_monthly_{last_month}")
-    
+
     stats["daily_str"] = f"{today_active} 人 (较昨日 {calc_growth(today_active, yesterday_active)})"
     stats["weekly_str"] = f"{this_week_active} 人 (较上周 {calc_growth(this_week_active, last_week_active)})"
     stats["monthly_str"] = f"{this_month_active} 人 (较上月 {calc_growth(this_month_active, last_month_active)})"
     return stats
 
+
 # ================= 核心：全链嗅探与深度解析 =================
 def get_token_full_info(ca_address):
+    """
+    入口分流：
+    - 0x 开头 -> EVM 逻辑
+    - 其他   -> Solana 专属逻辑
+    """
+    if not ca_address.startswith("0x"):
+        return _get_solana_token_info(ca_address)
+
+    # ============ 以下为原有 EVM 逻辑（未改动） ============
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
-    
+
     try:
         res = requests.get(dex_url, timeout=5).json()
         pairs = res.get("pairs", [])
@@ -166,14 +218,14 @@ def get_token_full_info(ca_address):
                     is_honeypot = info.get("is_honeypot", "0")
                     buy_tax = float(info.get("buy_tax") or 0) * 100
                     sell_tax = float(info.get("sell_tax") or 0) * 100
-                    
+
                     holders = info.get("holders", [])
                     top10_pct = 0.0
                     for h in holders[:10]:
                         addr = h.get("address", "").lower()
                         if addr not in ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"]:
                             top10_pct += float(h.get("percent") or 0) * 100
-                    
+
                     if is_honeypot == "1":
                         risk_reasons.append("貔貅盘（无法卖出）")
                         is_dangerous = True
@@ -188,7 +240,7 @@ def get_token_full_info(ca_address):
                     total_locked_pct = 0.0
                     lock_text_lines = []
                     now_ts = int(time.time())
-                    
+
                     for lp in lp_holders:
                         if lp.get("is_locked") == 1:
                             pct = float(lp.get("percent") or 0) * 100
@@ -227,6 +279,112 @@ def get_token_full_info(ca_address):
 
     return f"{header}📍 {chain_name} 链数据如下：\n" + "\n".join(msg_lines) + risk_text + "\n\n⚠️ DYOR！"
 
+
+def _get_solana_token_info(ca_address):
+    """Solana 代币专属检测：行情聚合 + GoPlus Solana 安全检测"""
+
+    # 1) DexScreener 行情
+    dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
+    try:
+        res = requests.get(dex_url, timeout=5).json()
+        pairs = res.get("pairs", [])
+    except Exception as e:
+        print(f"Solana 查行情失败: {e}")
+        pairs = []
+
+    if not pairs:
+        return "🐕‍🦺 嗅探失败：DexScreener 未收录该 Solana 代币，可能是极早期盘、假地址，或池子尚未建立。"
+
+    best_pair = max(
+        pairs,
+        key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0)
+    )
+    price = float(best_pair.get("priceUsd", "0") or 0)
+    fdv = float(best_pair.get("fdv", "0") or 0)
+
+    total_liq = sum(float((p.get("liquidity") or {}).get("usd", 0) or 0) for p in pairs)
+    total_vol = sum(float((p.get("volume") or {}).get("h24", 0) or 0) for p in pairs)
+
+    lines = [
+        f"💰 价格: ${price:.6f}",
+        f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)",
+        f"📈 24h总量: {fmt_money(total_vol)}",
+    ]
+
+    is_dangerous = False
+    risks = []
+
+    # 2) GoPlus Solana 安全检测
+    #    注意：Solana 地址大小写敏感，不要 lower()
+    goplus_url = (
+        f"https://api.gopluslabs.io/api/v1/solana/token_security"
+        f"?contract_addresses={ca_address}"
+    )
+    try:
+        g_res = requests.get(goplus_url, timeout=5).json()
+        if g_res.get("code") == 1 and g_res.get("result"):
+            info = g_res["result"].get(ca_address, {})
+            if info:
+                mintable = info.get("mintable", {}) or {}
+                freezable = info.get("freezable", {}) or {}
+                closable = info.get("closable", {}) or {}
+
+                mint_status = mintable.get("status", "0")
+                freeze_status = freezable.get("status", "0")
+                close_status = closable.get("status", "0")
+
+                if mint_status == "1":
+                    risks.append("Mint 权限未放弃（可无限增发砸盘）")
+                    is_dangerous = True
+                if freeze_status == "1":
+                    risks.append("Freeze 权限未放弃（可冻结账户，无法卖出）")
+                    is_dangerous = True
+                if close_status == "1":
+                    risks.append("Close 权限未放弃（可关闭账户转移余额）")
+                    is_dangerous = True
+
+                # 持有人集中度
+                holders = info.get("holders", []) or []
+                top10_pct = 0.0
+                for h in holders[:10]:
+                    top10_pct += float(h.get("percent", 0) or 0) * 100
+                if top10_pct > 80:
+                    risks.append(f"前10持仓高度集中 ({top10_pct:.1f}%)")
+                    is_dangerous = True
+
+                lines.append(
+                    f"🛡️ Mint权限: {'⚠️ 未放弃' if mint_status == '1' else '✅ 已放弃'} | "
+                    f"Freeze权限: {'⚠️ 未放弃' if freeze_status == '1' else '✅ 已放弃'}"
+                )
+                lines.append(f"👥 前10持仓(估算): {top10_pct:.1f}%")
+
+                # 持有人数量展示
+                if holders:
+                    lines.append(f"👨‍👩‍👧 收录持有人数: {len(holders)}")
+            else:
+                lines.append("🛡️ GoPlus 未返回该代币的安全数据。")
+        else:
+            lines.append("🛡️ GoPlus Solana 安全数据暂时不可用。")
+    except Exception as e:
+        print(f"Solana 安全查询异常: {e}")
+        lines.append("🛡️ 安全查询异常。")
+
+    # 流动性兜底
+    if total_liq < 1000:
+        if "流动性极低 (<$1000)" not in risks:
+            risks.append("流动性极低 (<$1000)")
+        is_dangerous = True
+
+    if is_dangerous:
+        header = "🚨 汪汪汪！！（狂吠）Solana 目标存在危险信号！\n"
+        risk_text = "\n⚠️ 危险提示: " + " | ".join(risks)
+    else:
+        header = "🐕 汪！（摇尾巴）Solana 嗅探完毕，权限已放弃，目前闻起来没毛病：\n"
+        risk_text = ""
+
+    return f"{header}📍 SOL 链数据如下：\n" + "\n".join(lines) + risk_text + "\n\n⚠️ DYOR！"
+
+
 def send_message(chat_type, chat_id, content):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
@@ -241,12 +399,12 @@ def send_message(chat_type, chat_id, content):
 def webhook():
     if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
         return jsonify({"error": "unauthorized"}), 401
-    
+
     data = request.get_json(silent=True) or {}
     message = data.get("message_raw", data.get("message", ""))
     group_id = data.get("group_id")
     from_user_id = data.get("from_user_id")
-    
+
     if group_id:
         record_realtime_group(group_id)
 
@@ -255,9 +413,9 @@ def webhook():
         if any(k in message.lower() for k in ["/help", "教程", "菜单", "说明"]):
             help_text = (
                 "🐕‍🦺 链上警犬使用说明\n\n"
-                "👉 查代币安全：直接在群内发送 0x 开头的合约地址（CA），警犬会立刻帮你排雷。\n"
+                "👉 查代币安全：直接在群内发送合约地址（支持 EVM 0x 开头 及 Solana Base58 地址），警犬会立刻帮你排雷。\n"
                 "👉 防钓鱼雷达：群内出现不明链接，警犬会自动拦截并发出警告。\n"
-                "👉 深度数据：自动聚合全链池子，并检测锁仓比例与庄家控盘率。\n\n"
+                "👉 深度数据：自动聚合全链池子，EVM 检测貔貅/税率/锁仓，Solana 检测 Mint/Freeze 权限。\n\n"
                 "💡 觉得好用？点击下方链接加入产品体验群，获取最新功能！\n"
                 "🔗 体验群链接：https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"
             )
@@ -267,11 +425,10 @@ def webhook():
 
         # 2. 管理员查后台
         if "/admin" in message or "/stats" in message:
-            # 兼容带 @ 和不带 @ 的情况
             if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
                 stats = get_usage_stats()
                 current_time = get_beijing_time().strftime('%H:%M')
-                
+
                 admin_msg = (
                     f"📊 链上警犬 · 实时运营看板\n\n"
                     f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
@@ -289,16 +446,27 @@ def webhook():
                     send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限查看哦！")
             return jsonify({"status": "ok"}), 200
 
-        # 3. 查 CA 风险
+        # 3. 查 CA 风险（EVM + Solana）
         match_ca = CA_PATTERN.search(message)
         if match_ca:
             ca_address = match_ca.group()
-            reply_text = get_token_full_info(ca_address)
-            if group_id: send_message("group", group_id, reply_text)
-            elif from_user_id: send_message("private", from_user_id, reply_text)
-            
-            record_user_activity(from_user_id)
-            return jsonify({"status": "ok"}), 200
+
+            # --- 有效性校验 ---
+            is_valid_ca = False
+            if ca_address.startswith("0x"):
+                is_valid_ca = True                      # EVM：正则已保证长度与字符集
+            elif is_valid_solana_address(ca_address):
+                is_valid_ca = True                      # Solana：Base58 解码后 32 字节
+
+            if is_valid_ca:
+                reply_text = get_token_full_info(ca_address)
+                if group_id: send_message("group", group_id, reply_text)
+                elif from_user_id: send_message("private", from_user_id, reply_text)
+
+                record_user_activity(from_user_id)
+                return jsonify({"status": "ok"}), 200
+            # 若为误报（例如普通英文长单词被 Base58 正则命中），
+            # 不 return，继续往下走检测 URL 逻辑
 
         # 4. 精准防钓鱼
         match_url = URL_PATTERN.search(message)
@@ -314,5 +482,6 @@ def webhook():
             except: pass
 
     return jsonify({"status": "ok"}), 200
+
 
 handler = app
