@@ -14,12 +14,13 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 # 数据后台配置
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+
+# ⚠️ 你的专属管理员 ID (已修改为真实的 9410sfdk)
 ADMIN_USER_ID = "9410sfdk" 
 
 CA_PATTERN = re.compile(r"0x[a-fA-F0-9]{40}")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
 
-# 链名称映射
 CHAIN_MAPPING = {
     "ethereum": "1", "bsc": "56", "polygon": "137",
     "arbitrum": "42161", "base": "8453", "avalanche": "43114",
@@ -31,7 +32,10 @@ CHAIN_NAMES = {
     "10": "OP"
 }
 
-# 数字格式化
+# 获取北京时间的函数
+def get_beijing_time():
+    return datetime.utcnow() + timedelta(hours=8)
+
 def fmt_money(n):
     try:
         n = float(n)
@@ -51,7 +55,7 @@ def record_realtime_group(group_id):
 def record_user_activity(user_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not user_id: return
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    now = datetime.now()
+    now = get_beijing_time()
     today_str = now.strftime("%Y%m%d")
     start_of_week = now - timedelta(days=now.weekday())
     week_str = start_of_week.strftime("%Y%m%d")
@@ -78,7 +82,7 @@ def calc_growth(current, previous):
     return f"{icon}{growth:.1f}%"
 
 def get_usage_stats():
-    now = datetime.now()
+    now = get_beijing_time()
     today = now.strftime("%Y%m%d")
     yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
     this_week = (now - timedelta(days=now.weekday())).strftime("%Y%m%d")
@@ -221,11 +225,8 @@ def get_token_full_info(ca_address):
         header = "🐕 汪！（摇尾巴）嗅探完毕，目前闻起来没毛病：\n"
         risk_text = ""
 
-    final_text = f"{header}📍 {chain_name} 链数据如下：\n" + "\n".join(msg_lines) + risk_text + "\n\n⚠️ DYOR！"
-    
-    return final_text
+    return f"{header}📍 {chain_name} 链数据如下：\n" + "\n".join(msg_lines) + risk_text + "\n\n⚠️ DYOR！"
 
-# 保留 v1 接口，不带按钮参数
 def send_message(chat_type, chat_id, content):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
@@ -250,7 +251,7 @@ def webhook():
         record_realtime_group(group_id)
 
     if message:
-        # 1. 使用教程（纯文本加链接）
+        # 1. 使用教程
         if any(k in message.lower() for k in ["/help", "教程", "菜单", "说明"]):
             help_text = (
                 "🐕‍🦺 链上警犬使用说明\n\n"
@@ -266,8 +267,11 @@ def webhook():
 
         # 2. 管理员查后台
         if "/admin" in message or "/stats" in message:
+            # 兼容带 @ 和不带 @ 的情况
             if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
                 stats = get_usage_stats()
+                current_time = get_beijing_time().strftime('%H:%M')
+                
                 admin_msg = (
                     f"📊 链上警犬 · 实时运营看板\n\n"
                     f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
@@ -277,7 +281,7 @@ def webhook():
                     f"🔸 今日: {stats['daily_str']}\n"
                     f"🔸 本周: {stats['weekly_str']}\n"
                     f"🔸 本月: {stats['monthly_str']}\n\n"
-                    f"*数据更新于 {datetime.now().strftime('%H:%M')}*"
+                    f"*数据更新于 {current_time}*"
                 )
                 send_message("private", from_user_id, admin_msg)
             else:
