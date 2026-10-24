@@ -426,4 +426,57 @@ def webhook():
                 stats = get_usage_stats()
                 current_time = get_beijing_time().strftime('%H:%M')
 
-                a
+                admin_msg = (
+                    f"📊 链上警犬 · 实时运营看板\n\n"
+                    f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
+                    f"🔍 累计查币次数: {stats['total_queries']:,} 次\n"
+                    f"🧑‍💻 累计独立用户: {stats['total_users']:,} 人\n\n"
+                    f"📈 活跃用户环比 (日/周/月):\n"
+                    f"🔸 今日: {stats['daily_str']}\n"
+                    f"🔸 本周: {stats['weekly_str']}\n"
+                    f"🔸 本月: {stats['monthly_str']}\n\n"
+                    f"*数据更新于 {current_time}*"
+                )
+                send_message("private", from_user_id, admin_msg)
+            else:
+                if from_user_id:
+                    send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限查看哦！")
+            return jsonify({"status": "ok"}), 200
+
+        # 3. 查 CA 风险（EVM + Solana）
+        match_ca = CA_PATTERN.search(message)
+        if match_ca:
+            ca_address = match_ca.group()
+
+            # --- 有效性校验 ---
+            is_valid_ca = False
+            if ca_address.startswith("0x"):
+                is_valid_ca = True                      # EVM：正则已保证长度与字符集
+            elif is_valid_solana_address(ca_address):
+                is_valid_ca = True                      # Solana：Base58 解码后 32 字节
+
+            if is_valid_ca:
+                reply_text = get_token_full_info(ca_address)
+                if group_id: send_message("group", group_id, reply_text)
+                elif from_user_id: send_message("private", from_user_id, reply_text)
+
+                record_user_activity(from_user_id)
+                return jsonify({"status": "ok"}), 200
+
+        # 4. 精准防钓鱼
+        match_url = URL_PATTERN.search(message)
+        if match_url and group_id:
+            url = match_url.group()
+            try:
+                domain = urlparse(url).netloc.lower()
+                allowed_domains = ["twitter.com", "x.com", "debox.pro"]
+                is_safe = any(domain == d or domain.endswith("." + d) for d in allowed_domains)
+                if not is_safe:
+                    reply_text = f"🐕 警告：嗅探到不明链接！\n\n🌐 域名: {domain}\n警犬闻到了钓鱼的风险，请群友警惕，不要随意点击授权钱包！"
+                    send_message("group", group_id, reply_text)
+            except: pass
+
+    return jsonify({"status": "ok"}), 200
+
+
+handler = app
