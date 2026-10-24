@@ -163,7 +163,7 @@ def get_token_full_info(ca_address):
     if not ca_address.startswith("0x"):
         return _get_solana_token_info(ca_address)
 
-    # ============ 以下为原有 EVM 逻辑（未改动） ============
+    # ============ 以下为原有 EVM 逻辑 ============
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
 
     try:
@@ -181,7 +181,6 @@ def get_token_full_info(ca_address):
     chain_id = CHAIN_MAPPING.get(dex_chain)
     chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
 
-    price = float(best_pair.get("priceUsd", "0"))
     fdv = float(best_pair.get("fdv", "0"))
 
     total_liq = 0.0
@@ -196,7 +195,7 @@ def get_token_full_info(ca_address):
     is_dangerous = False
     risk_reasons = []
 
-    msg_lines.append(f"💰 价格: ${price:.6f}")
+    # 👇 价格已删除
     msg_lines.append(f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)")
     msg_lines.append(f"📈 24h总量: {fmt_money(total_vol)}")
 
@@ -299,14 +298,13 @@ def _get_solana_token_info(ca_address):
         pairs,
         key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0)
     )
-    price = float(best_pair.get("priceUsd", "0") or 0)
     fdv = float(best_pair.get("fdv", "0") or 0)
 
     total_liq = sum(float((p.get("liquidity") or {}).get("usd", 0) or 0) for p in pairs)
     total_vol = sum(float((p.get("volume") or {}).get("h24", 0) or 0) for p in pairs)
 
     lines = [
-        f"💰 价格: ${price:.6f}",
+        # 👇 价格已删除
         f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)",
         f"📈 24h总量: {fmt_money(total_vol)}",
     ]
@@ -315,7 +313,6 @@ def _get_solana_token_info(ca_address):
     risks = []
 
     # 2) GoPlus Solana 安全检测
-    #    注意：Solana 地址大小写敏感，不要 lower()
     goplus_url = (
         f"https://api.gopluslabs.io/api/v1/solana/token_security"
         f"?contract_addresses={ca_address}"
@@ -465,8 +462,6 @@ def webhook():
 
                 record_user_activity(from_user_id)
                 return jsonify({"status": "ok"}), 200
-            # 若为误报（例如普通英文长单词被 Base58 正则命中），
-            # 不 return，继续往下走检测 URL 逻辑
 
         # 4. 精准防钓鱼
         match_url = URL_PATTERN.search(message)
