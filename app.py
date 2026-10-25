@@ -241,6 +241,9 @@ def build_evm_lines(info, chain_line, chain_id=None):
                   + fmt_flag("开源", info.get("is_open_source"), safe_when="1")
                   + fmt_flag("自毁", info.get("self_destruct"))
                   + fmt_flag("代理", info.get("is_proxy"))
+                  + fmt_flag("藏Owner", info.get("hidden_owner"))
+                  + fmt_flag("收回权", info.get("can_take_back_ownership"))
+                  + fmt_flag("改余额", info.get("owner_change_balance"))
                   + fmt_flag("增发", info.get("is_mintable"))
                   + fmt_flag("白名单", info.get("is_whitelisted"))
                   + fmt_flag("暂停", info.get("transfer_pausable"))
@@ -248,6 +251,9 @@ def build_evm_lines(info, chain_line, chain_id=None):
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if info.get("is_open_source") == "0": risks.append("未开源")
+    if info.get("hidden_owner") == "1": risks.append("隐藏Owner")
+    if info.get("can_take_back_ownership") == "1": risks.append("可收回权限")
+    if info.get("owner_change_balance") == "1": risks.append("可改余额")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
     # 死控盘只看个人地址（EOA）持仓：合约持仓多为质押池/金库/交易所，不直接算砸盘风险
     if eoa_pct > 80: risks.append("死控盘")
