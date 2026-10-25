@@ -108,31 +108,42 @@ def get_usage_stats():
     stats["monthly_str"] = f"{this_month_active} 人 (较上月 {calc_growth(this_month_active, last_month_active)})"
     return stats
 
-# ================= 极简前端查币 =================
+# ================= 极简前端查币（含强行兜底查安全） =================
 def get_token_full_info(ca_address):
     if not ca_address.startswith("0x"): return _get_solana_info(ca_address)
+    return _get_evm_info(ca_address)
 
+def _get_evm_info(ca_address):
     try: pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}", timeout=5).json().get("pairs", [])
     except: pairs = []
 
-    if not pairs: return "🐕‍🦺 暂未收录该代币行情（可能极早期），请谨慎。"
+    has_dex_data = False
+    chain_id = "56" # 默认按BSC查安全
+    chain_name = "未知"
+    fdv = 0.0
+    total_liq = 0.0
 
-    best_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) if x.get("liquidity") else 0))
-    chain_id = CHAIN_MAPPING.get(best_pair.get("chainId", "bsc"))
-    chain_name = CHAIN_NAMES.get(chain_id, best_pair.get("chainId", "未知").upper())
-    fdv = float(best_pair.get("fdv", "0"))
-    total_liq = sum(float(p.get("liquidity", {}).get("usd", 0)) for p in pairs if p.get("liquidity"))
+    if pairs:
+        has_dex_data = True
+        best_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) if x.get("liquidity") else 0))
+        chain_id = CHAIN_MAPPING.get(best_pair.get("chainId", "bsc"))
+        chain_name = CHAIN_NAMES.get(chain_id, best_pair.get("chainId", "未知").upper())
+        fdv = float(best_pair.get("fdv", "0"))
+        total_liq = sum(float(p.get("liquidity", {}).get("usd", 0)) for p in pairs if p.get("liquidity"))
 
     is_dangerous = False
     risk_reasons = []
     
-    tax_str = "0.0% / 0.0%"
-    top10_str = "0.0%"
+    tax_str = "0% / 0%"
+    top10_str = "0%"
     lock_str = "0%"
     audit_str = "自毁✅ 代理✅ 增发✅ 白名单✅ 暂停✅ 黑名单✅"
 
-    if total_liq < 1000: is_dangerous = True; risk_reasons.append("池子极小")
+    if total_liq < 1000 and has_dex_data: 
+        is_dangerous = True
+        risk_reasons.append("池子极小")
 
+    # 🌟 无论有没有行情，都强制查安全！
     if chain_id:
         try:
             g_res = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca_address}", timeout=5).json()
@@ -148,7 +159,7 @@ def get_token_full_info(ca_address):
                 top10_str = f"{top10_pct:.1f}%"
 
                 total_locked = sum(float(lp.get("percent") or 0) * 100 for lp in info.get("lp_holders", []) if lp.get("is_locked") == 1)
-                if total_locked == 0: risk_reasons.append("未锁")
+                if total_locked == 0 and has_dex_data: risk_reasons.append("未锁")
                 lock_str = f"{total_locked:.0f}%"
 
                 # 深度审计
@@ -173,30 +184,45 @@ def get_token_full_info(ca_address):
                 if is_black: audit_parts.append("黑名单❌"); is_dangerous = True; risk_reasons.append("黑名单")
                 else: audit_parts.append("黑名单✅")
                 audit_str = " ".join(audit_parts)
+            else:
+                if not has_dex_data:
+                    return "🐕‍🦺 该代币极早期：DexScreener 无行情，GoPlus 也无安全数据。请极度谨慎！"
         except: pass
 
     header = "🚨 **警犬狂吠！极度危险！**\n" if is_dangerous else "🐕 **警犬摇尾巴！暂未发现风险。**\n"
     conclusion = f"❌ **结论：极高风险（{'|'.join(set(risk_reasons))}），千万别碰！** DYOR." if is_dangerous else "✅ **结论：扫描通过，自行判断。** DYOR."
     
-    body = (
-        f"📍 {chain_name} | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}\n"
-        f"🩸 税: {tax_str} | 👥 前10: {top10_str} | 🔒 锁仓: {lock_str}\n"
-        f"🛡️ 审计: {audit_str}\n"
-    )
+    if has_dex_data:
+        body = (
+            f"📍 {chain_name} | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}\n"
+            f"🩸 税: {tax_str} | 👥 前10: {top10_str} | 🔒 锁仓: {lock_str}\n"
+            f"🛡️ 审计: {audit_str}\n"
+        )
+    else:
+        body = (
+            f"📍 未收录行情(极早期) | 安全检测如下\n"
+            f"🩸 税: {tax_str} | 👥 前10: {top10_str}\n"
+            f"🛡️ 审计: {audit_str}\n"
+        )
+    
     return f"{header}{body}{conclusion}"
 
 def _get_solana_info(ca_address):
     try: pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}", timeout=5).json().get("pairs", [])
     except: pairs = []
-    if not pairs: return "🐕‍🦺 暂未收录该 Solana 代币，请谨慎。"
+    
+    has_dex_data = bool(pairs)
+    fdv = 0.0
+    total_liq = 0.0
 
-    best_pair = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0))
-    fdv = float(best_pair.get("fdv", "0") or 0)
-    total_liq = sum(float((p.get("liquidity") or {}).get("usd", 0) or 0) for p in pairs)
+    if has_dex_data:
+        best_pair = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0))
+        fdv = float(best_pair.get("fdv", "0") or 0)
+        total_liq = sum(float((p.get("liquidity") or {}).get("usd", 0) or 0) for p in pairs)
     
     is_dangerous = False
     risks = []
-    if total_liq < 1000: is_dangerous = True; risks.append("池子极小")
+    if total_liq < 1000 and has_dex_data: is_dangerous = True; risks.append("池子极小")
 
     mint, freeze, top10 = "✅", "✅", "0.0%"
     try:
@@ -208,23 +234,33 @@ def _get_solana_info(ca_address):
             t10 = sum(float(h.get("percent", 0) or 0) * 100 for h in info.get("holders", [])[:10])
             if t10 > 80: is_dangerous = True; risks.append("死控盘")
             top10 = f"{t10:.1f}%"
+        else:
+            if not has_dex_data:
+                return "🐕‍🦺 该代币极早期：DexScreener 无行情，GoPlus 也无安全数据。请极度谨慎！"
     except: pass
 
     header = "🚨 **警犬狂吠！极度危险！**\n" if is_dangerous else "🐕 **警犬摇尾巴！暂未发现风险。**\n"
     conclusion = f"❌ **结论：极高风险（{'|'.join(set(risks))}），千万别碰！** DYOR." if is_dangerous else "✅ **结论：扫描通过，自行判断。** DYOR."
     
-    body = (
-        f"📍 SOL | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}\n"
-        f"🛡️ 权限: Mint {mint} | Freeze {freeze}\n"
-        f"👥 前10持仓: {top10}\n"
-    )
+    if has_dex_data:
+        body = (
+            f"📍 SOL | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}\n"
+            f"🛡️ 权限: Mint {mint} | Freeze {freeze}\n"
+            f"👥 前10持仓: {top10}\n"
+        )
+    else:
+        body = (
+            f"📍 未收录行情(极早期) | 安全检测如下\n"
+            f"🛡️ 权限: Mint {mint} | Freeze {freeze}\n"
+            f"👥 前10持仓: {top10}\n"
+        )
     return f"{header}{body}{conclusion}"
 
 def send_message(chat_type, chat_id, content):
     try: requests.post("https://open.debox.pro/openapi/bot/sendMessage", json={"chat_type": chat_type, "chat_id": chat_id, "content": content, "parse_mode": "text"}, headers={"Content-Type": "application/json", "X-API-KEY": APP_KEY}, timeout=10)
     except: pass
 
-# ================= Webhook 路由 =================
+# ================= Webhook 路由 (CA 绝对优先逻辑) =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
@@ -234,12 +270,44 @@ def webhook():
     message = data.get("message_raw", data.get("message", ""))
     group_id = data.get("group_id")
     from_user_id = data.get("from_user_id")
-    ca_address = data.get("address")  # 🌟 完美兼容 DeBox 代币卡片
+    ca_address = data.get("address")  # 🌟 优先读取 DeBox 卡片地址
 
     if group_id: record_realtime_group(group_id)
 
     if message or ca_address:
-        # 1. 防钓鱼（极简拦截）
+        # 1. 后台看板指令（最高优）
+        if message and ("/admin" in message or "/stats" in message):
+            if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
+                stats = get_usage_stats()
+                current_time = get_beijing_time().strftime('%H:%M')
+                admin_msg = (
+                    f"📊 链上警犬 · 实时运营看板\n\n"
+                    f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
+                    f"🔍 累计查币次数: {stats['total_queries']:,} 次\n"
+                    f"🧑‍💻 累计独立用户: {stats['total_users']:,} 人\n\n"
+                    f"📈 活跃用户环比 (日/周/月):\n"
+                    f"🔸 今日: {stats['daily_str']}\n"
+                    f"🔸 本周: {stats['weekly_str']}\n"
+                    f"🔸 本月: {stats['monthly_str']}\n\n"
+                    f"*数据更新于 {current_time}*"
+                )
+                send_message("private", from_user_id, admin_msg)
+            return jsonify({"status": "ok"}), 200
+
+        # 2. 🌟 查 CA（绝对优先，先提取 CA，防止被链接干扰）
+        if not ca_address and message:
+            clean_msg = URL_PATTERN.sub("", message) # 剔除链接防误伤
+            match_ca = CA_PATTERN.search(clean_msg)
+            if match_ca: ca_address = match_ca.group()
+
+        if ca_address:
+            if ca_address.startswith("0x") or is_valid_solana_address(ca_address):
+                reply_text = get_token_full_info(ca_address)
+                send_message("group" if group_id else "private", group_id or from_user_id, reply_text)
+                record_user_activity(from_user_id)
+                return jsonify({"status": "ok"}), 200
+
+        # 3. 防钓鱼（只有在没找到 CA 的情况下才执行）
         if message and group_id:
             for m in URL_PATTERN.finditer(message):
                 domain = (urlparse(m.group()).hostname or "").lower()
@@ -252,39 +320,6 @@ def webhook():
                         return jsonify({"status": "ok"}), 200
                 except: pass
                 continue
-
-        # 2. 后台看板
-        if message:
-            if "/admin" in message or "/stats" in message:
-                if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
-                    stats = get_usage_stats()
-                    current_time = get_beijing_time().strftime('%H:%M')
-                    admin_msg = (
-                        f"📊 链上警犬 · 实时运营看板\n\n"
-                        f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
-                        f"🔍 累计查币次数: {stats['total_queries']:,} 次\n"
-                        f"🧑‍💻 累计独立用户: {stats['total_users']:,} 人\n\n"
-                        f"📈 活跃用户环比 (日/周/月):\n"
-                        f"🔸 今日: {stats['daily_str']}\n"
-                        f"🔸 本周: {stats['weekly_str']}\n"
-                        f"🔸 本月: {stats['monthly_str']}\n\n"
-                        f"*数据更新于 {current_time}*"
-                    )
-                    send_message("private", from_user_id, admin_msg)
-                return jsonify({"status": "ok"}), 200
-
-        # 3. 查币（优先读取卡片地址，其次正则提取）
-        if not ca_address and message:
-            clean_msg = URL_PATTERN.sub("", message)
-            match_ca = CA_PATTERN.search(clean_msg)
-            if match_ca: ca_address = match_ca.group()
-
-        if ca_address:
-            if ca_address.startswith("0x") or is_valid_solana_address(ca_address):
-                reply_text = get_token_full_info(ca_address)
-                send_message("group" if group_id else "private", group_id or from_user_id, reply_text)
-                record_user_activity(from_user_id)
-                return jsonify({"status": "ok"}), 200
 
     return jsonify({"status": "ok"}), 200
 
