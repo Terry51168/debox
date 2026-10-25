@@ -279,6 +279,13 @@ def get_token_full_info(ca_address):
     def liq_of(p):
         return to_float((p.get("liquidity") or {}).get("usd"))
 
+    # 只统计本代币作为基础代币(baseToken)的池子：
+    # 排除"别的代币拿它当计价货币"的池子，那些流动性不属于本代币
+    own_pairs = [p for p in pairs
+                 if (p.get("baseToken") or {}).get("address", "").lower() == ca_address.lower()]
+    if own_pairs:
+        pairs = own_pairs
+
     low_liq = False
     if pairs:
         best_pair = max(pairs, key=liq_of)
@@ -286,9 +293,11 @@ def get_token_full_info(ca_address):
         chain_id = CHAIN_MAPPING.get(dex_chain)
         chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
         fdv = to_float(best_pair.get("fdv"))
+        # 优先用真实市值（当前价×流通量），没有再用 FDV（当前价×最大供应量）
+        mcap = to_float(best_pair.get("marketCap")) or fdv
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True
-        chain_line = f"📍 {chain_name} | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}"
+        chain_line = f"📍 {chain_name} | 市值: {fmt_money(mcap)} | 池子: {fmt_money(total_liq)}"
     else:
         # 无行情（极早期）：遍历支持的链尝试拿到安全数据
         chain_id, chain_name = None, ""
@@ -323,14 +332,21 @@ def _get_solana_token_info(ca_address):
     def liq_of(p):
         return to_float((p.get("liquidity") or {}).get("usd"))
 
+    # 同 EVM：只统计本代币作为基础代币的池子
+    own_pairs = [p for p in pairs
+                 if (p.get("baseToken") or {}).get("address", "").lower() == ca_address.lower()]
+    if own_pairs:
+        pairs = own_pairs
+
     risks = []
     low_liq = False
     if pairs:
         best_pair = max(pairs, key=liq_of)
         fdv = to_float(best_pair.get("fdv"))
+        mcap = to_float(best_pair.get("marketCap")) or fdv
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True; risks.append("流动性极低")
-        chain_line = f"📍 SOL | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}"
+        chain_line = f"📍 SOL | 市值: {fmt_money(mcap)} | 池子: {fmt_money(total_liq)}"
     else:
         chain_line = "📍 未收录行情(极早期) | 安全检测如下"
 
