@@ -37,7 +37,7 @@ CHAIN_NAMES = {
 # Base58 字符集（用于 Solana 地址严格校验）
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-# ===== 简易查询缓存：同 CA 60 秒内不重复打 API（防刷屏 + 省 GoPlus 额度）=====
+# ===== 简易查询缓存：同 CA 60 秒内不重复打 API =====
 _QUERY_CACHE = {}
 QUERY_CACHE_TTL = 60
 
@@ -65,7 +65,6 @@ def is_valid_solana_address(addr):
 
 
 def get_beijing_time():
-    # utcnow() 已废弃，改用时区感知写法
     return datetime.now(timezone(timedelta(hours=8)))
 
 
@@ -73,18 +72,23 @@ def fmt_money(n):
     try:
         n = float(n)
         if n >= 1000000: return f"${n/1000000:.2f}M"
-        if n >= 1000: return f"${n/1000:.2f}K"
+        if n >= 1000: return f"${n/1000:.1f}K"
         return f"${n:.2f}"
     except (TypeError, ValueError):
         return "$0.00"
 
 
 def to_float(v, default=0.0):
-    """安全转 float：None / 空串 / 非数字统一兜底"""
     try:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def fmt_flag(name, value, safe_when="0"):
+    """审计开关：✅=安全，❌=危险。value 为 "0"/"1"。缺数据按安全处理。"""
+    ok = (str(value or "0") == safe_when)
+    return f"{name}{'✅' if ok else '❌'}"
 
 
 # ================= 运营数据统计系统 =================
@@ -164,132 +168,129 @@ def get_usage_stats():
 
 
 # ================= 核心：查币逻辑 =================
+def goplus_evm(chain_id, ca_address):
+    """查询 GoPlus EVM 安全数据，失败返回 {}"""
+    url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca_address}"
+    try:
+        res = requests.get(url, timeout=5).json()
+        if res.get("code") == 1 and res.get("result"):
+            return res["result"].get(ca_address.lower(), {}) or {}
+    except Exception as e:
+        print(f"[query] GoPlus EVM 异常: {e}")
+    return {}
+
+
+def build_evm_lines(info, chain_line):
+    """根据 GoPlus 数据生成税/持仓/锁仓行、审计行、风险标签列表"""
+    risks = []
+    buy_tax = to_float(info.get("buy_tax")) * 100
+    sell_tax = to_float(info.get("sell_tax")) * 100
+    top10_pct = sum(to_float(h.get("percent")) * 100 for h in (info.get("holders") or [])[:10]
+                    if (h.get("address", "") or "").lower() not in
+                    ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"])
+    locked_pct = sum(to_float(lp.get("percent")) * 100 for lp in (info.get("lp_holders") or [])
+                     if lp.get("is_locked") == 1)
+
+    line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
+    line_audit = ("🛡️ 审计: "
+                  + fmt_flag("自毁", info.get("self_destruct"))
+                  + fmt_flag("代理", info.get("is_proxy"))
+                  + fmt_flag("增发", info.get("is_mintable"))
+                  + fmt_flag("白名单", info.get("is_whitelisted"))
+                  + fmt_flag("暂停", info.get("transfer_pausable"))
+                  + fmt_flag("黑名单", info.get("is_blacklisted")))
+
+    if info.get("is_honeypot") == "1": risks.append("貔貅")
+    if buy_tax > 10 or sell_tax > 10: risks.append("高税")
+    if top10_pct > 80: risks.append("死控盘")
+    if info.get("is_mintable") == "1": risks.append("增发")
+    if info.get("is_blacklisted") == "1": risks.append("黑名单")
+
+    return line_tax, line_audit, risks
+
+
+def assemble_report(header, chain_line, lines, risks, low_liq=False):
+    if low_liq: risks = risks + ["流动性极低"]
+    if risks:
+        lines = [f"🚨 警犬狂吠！极度危险！"] + [chain_line] + lines
+        conclusion = f"❌ 结论：极高风险（{'|'.join(risks)}），千万别碰！ DYOR."
+    else:
+        lines = ["🐕 警犬摇尾巴！暂未发现风险。"] + [chain_line] + lines
+        conclusion = "✅ 结论：扫描通过，自行判断。 DYOR."
+    return "\n".join(lines + [conclusion])
+
+
 def get_token_full_info(ca_address):
     if not ca_address.startswith("0x"):
         return _get_solana_token_info(ca_address)
 
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
+    pairs = []
     try:
         res = requests.get(dex_url, timeout=5).json()
         pairs = res.get("pairs", []) or []
     except Exception as e:
         print(f"[query] DexScreener 异常: {e}")
-        pairs = []
-
-    if not pairs:
-        return "🐕‍🦺 嗅探失败：没查到行情数据，可能是极早期盘、假地址，或不在已收录的链上。"
 
     def liq_of(p):
         return to_float((p.get("liquidity") or {}).get("usd"))
 
-    def vol_of(p):
-        return to_float((p.get("volume") or {}).get("h24"))
-
-    best_pair = max(pairs, key=liq_of)
-    dex_chain = best_pair.get("chainId", "bsc")
-    chain_id = CHAIN_MAPPING.get(dex_chain)
-    chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
-    fdv = to_float(best_pair.get("fdv"))  # 修复：fdv 可能为 null，原 float(None) 会崩
-
-    total_liq = sum(liq_of(p) for p in pairs)
-    total_vol = sum(vol_of(p) for p in pairs)
-
-    msg_lines = []
-    is_dangerous = False
-    risk_reasons = []
-
-    msg_lines.append(f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)")
-    msg_lines.append(f"📈 24h总量: {fmt_money(total_vol)}")
-
-    if total_liq < 1000:
-        risk_reasons.append("全链总流动性极低 (<$1000)")
-        is_dangerous = True
+    low_liq = False
+    if pairs:
+        best_pair = max(pairs, key=liq_of)
+        dex_chain = best_pair.get("chainId", "bsc")
+        chain_id = CHAIN_MAPPING.get(dex_chain)
+        chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
+        fdv = to_float(best_pair.get("fdv"))
+        total_liq = sum(liq_of(p) for p in pairs)
+        if total_liq < 1000: low_liq = True
+        chain_line = f"📍 {chain_name} | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}"
+    else:
+        # 无行情（极早期）：遍历支持的链尝试拿到安全数据
+        chain_id, chain_name = None, ""
+        for cid in set(CHAIN_MAPPING.values()):
+            info_probe = goplus_evm(cid, ca_address)
+            if info_probe:
+                chain_id = cid
+                chain_name = CHAIN_NAMES.get(cid, cid)
+                break
+        chain_line = "📍 未收录行情(极早期) | 安全检测如下"
 
     if not chain_id:
-        msg_lines.append(f"🛡️ 暂不支持该链({chain_name})的深度安全检测。")
-    else:
-        goplus_url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca_address}"
-        try:
-            g_res = requests.get(goplus_url, timeout=5).json()
-            if g_res.get("code") == 1 and g_res.get("result"):
-                info = g_res["result"].get(ca_address.lower(), {}) or {}
-                if not info:
-                    msg_lines.append("🛡️ 暂未获取到该合约的安全数据。")
-                else:
-                    is_honeypot = info.get("is_honeypot", "0")
-                    buy_tax = to_float(info.get("buy_tax")) * 100
-                    sell_tax = to_float(info.get("sell_tax")) * 100
-                    top10_pct = sum(to_float(h.get("percent")) * 100 for h in (info.get("holders") or [])[:10]
-                                    if (h.get("address", "") or "").lower() not in
-                                    ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"])
+        return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
 
-                    if is_honeypot == "1": risk_reasons.append("貔貅盘（无法卖出）"); is_dangerous = True
-                    if buy_tax > 10 or sell_tax > 10: risk_reasons.append(f"高额交易税(买{buy_tax:.1f}%/卖{sell_tax:.1f}%)"); is_dangerous = True
-                    if top10_pct > 80: risk_reasons.append(f"持仓高度集中(前10占{top10_pct:.1f}%)"); is_dangerous = True
+    info = goplus_evm(chain_id, ca_address)
+    if not info:
+        return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
 
-                    msg_lines.append(f"🛡️ 税率: 买{buy_tax:.1f}% 卖{sell_tax:.1f}% | 前10持仓(剔除黑洞): {top10_pct:.1f}%")
-
-                    total_locked_pct, lock_text_lines = 0.0, []
-                    now_ts = int(time.time())
-                    for lp in (info.get("lp_holders") or []):
-                        if lp.get("is_locked") == 1:
-                            pct = to_float(lp.get("percent")) * 100
-                            total_locked_pct += pct
-                            end_time_str = ""
-                            details = lp.get("locked_detail") or []
-                            if details:
-                                end_time = details[0].get("end_time")
-                                if end_time and str(end_time).isdigit():
-                                    end_int = int(end_time)
-                                    if end_int > now_ts:
-                                        dt = datetime.fromtimestamp(end_int)
-                                        end_time_str = f"至 {dt.strftime('%Y-%m-%d')}"
-                                    else: end_time_str = "已过期"
-                            lock_text_lines.append(f"  ↳ 锁仓 {pct:.1f}% {end_time_str}")
-
-                    if total_locked_pct > 0:
-                        msg_lines.append(f"🔒 池子总锁仓: {total_locked_pct:.1f}%")
-                        msg_lines.extend(lock_text_lines)
-                    else:
-                        msg_lines.append(f"🔒 池子锁仓: 0.0% (未检测到锁定)")
-            else:
-                msg_lines.append("🛡️ 安全数据暂时无法获取。")
-        except Exception as e:
-            print(f"[query] GoPlus EVM 异常: {e}")
-            msg_lines.append("🛡️ 安全数据查询异常。")
-
-    header = "🚨 汪汪汪！！（狂吠）报告老板，发现危险目标！\n" if is_dangerous else "🐕 汪！（摇尾巴）嗅探完毕，目前闻起来没毛病：\n"
-    risk_text = "\n⚠️ 危险提示: " + " | ".join(risk_reasons) if risk_reasons else ""
-    return f"{header}📍 {chain_name} 链数据如下：\n" + "\n".join(msg_lines) + risk_text + "\n\n⚠️ DYOR！"
+    line_tax, line_audit, risks = build_evm_lines(info, chain_line)
+    return assemble_report(None, chain_line, [line_tax, line_audit], risks, low_liq)
 
 
 def _get_solana_token_info(ca_address):
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
+    pairs = []
     try:
         res = requests.get(dex_url, timeout=5).json()
         pairs = res.get("pairs", []) or []
     except Exception as e:
         print(f"[query] DexScreener SOL 异常: {e}")
-        pairs = []
-
-    if not pairs:
-        return "🐕‍🦺 嗅探失败：DexScreener 未收录该 Solana 代币，可能是极早期盘、假地址，或池子尚未建立。"
 
     def liq_of(p):
         return to_float((p.get("liquidity") or {}).get("usd"))
 
-    best_pair = max(pairs, key=liq_of)
-    fdv = to_float(best_pair.get("fdv"))
-    total_liq = sum(liq_of(p) for p in pairs)
-    total_vol = sum(to_float((p.get("volume") or {}).get("h24")) for p in pairs)
-
-    lines = [
-        f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)",
-        f"📈 24h总量: {fmt_money(total_vol)}",
-    ]
-    is_dangerous = False
     risks = []
+    low_liq = False
+    if pairs:
+        best_pair = max(pairs, key=liq_of)
+        fdv = to_float(best_pair.get("fdv"))
+        total_liq = sum(liq_of(p) for p in pairs)
+        if total_liq < 1000: low_liq = True; risks.append("流动性极低")
+        chain_line = f"📍 SOL | 市值: {fmt_money(fdv)} | 池子: {fmt_money(total_liq)}"
+    else:
+        chain_line = "📍 未收录行情(极早期) | 安全检测如下"
 
+    lines = []
     goplus_url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={ca_address}"
     try:
         g_res = requests.get(goplus_url, timeout=5).json()
@@ -299,25 +300,19 @@ def _get_solana_token_info(ca_address):
                 mint_status = (info.get("mintable") or {}).get("status", "0")
                 freeze_status = (info.get("freezable") or {}).get("status", "0")
                 close_status = (info.get("closable") or {}).get("status", "0")
-
-                if mint_status == "1": risks.append("Mint 权限未放弃（可无限增发砸盘）"); is_dangerous = True
-                if freeze_status == "1": risks.append("Freeze 权限未放弃（可冻结账户，无法卖出）"); is_dangerous = True
-                if close_status == "1": risks.append("Close 权限未放弃（可关闭账户转移余额）"); is_dangerous = True
-
                 holders = info.get("holders", []) or []
                 top10_pct = sum(to_float(h.get("percent")) * 100 for h in holders[:10])
-                if top10_pct > 80: risks.append(f"前10持仓高度集中 ({top10_pct:.1f}%)"); is_dangerous = True
 
-                lines.append(f"🛡️ Mint权限: {'⚠️ 未放弃' if mint_status == '1' else '✅ 已放弃'} | Freeze权限: {'⚠️ 未放弃' if freeze_status == '1' else '✅ 已放弃'}")
-                lines.append(f"👥 前10持仓(估算): {top10_pct:.1f}%")
+                lines.append(f"🛡️ 权限: Mint {'✅' if mint_status != '1' else '❌'} | Freeze {'✅' if freeze_status != '1' else '❌'} | Close {'✅' if close_status != '1' else '❌'}")
+                lines.append(f"👥 前10持仓: {top10_pct:.1f}%")
+
+                if mint_status == "1": risks.append("Mint未放弃")
+                if freeze_status == "1": risks.append("Freeze未放弃")
+                if top10_pct > 80: risks.append("死控盘")
     except Exception as e:
         print(f"[query] GoPlus SOL 异常: {e}")
 
-    if total_liq < 1000: risks.append("流动性极低 (<$1000)"); is_dangerous = True
-
-    header = "🚨 汪汪汪！！（狂吠）Solana 目标存在危险信号！\n" if is_dangerous else "🐕 汪！（摇尾巴）Solana 嗅探完毕，权限已放弃，目前闻起来没毛病：\n"
-    risk_text = "\n⚠️ 危险提示: " + " | ".join(risks) if risks else ""
-    return f"{header}📍 SOL 链数据如下：\n" + "\n".join(lines) + risk_text + "\n\n⚠️ DYOR！"
+    return assemble_report(None, chain_line, lines, risks, low_liq)
 
 
 def send_message(chat_type, chat_id, content):
@@ -331,10 +326,7 @@ def send_message(chat_type, chat_id, content):
 
 
 def extract_valid_ca(message):
-    """
-    从消息中提取第一个通过校验的 CA 地址。
-    先剔除 URL，避免 URL 路径里的长字符串污染 Base58 匹配。
-    """
+    """剔除 URL 后提取第一个通过校验的 CA 地址"""
     cleaned = URL_PATTERN.sub(" ", message)
     for m in CA_PATTERN.finditer(cleaned):
         addr = m.group()
@@ -405,7 +397,6 @@ def webhook():
                 if not is_safe:
                     try:
                         resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                        # 兼容 result 直接为 dict 或以 url 为 key 的嵌套 dict，且值可能是 "1"/1
                         result = resp.get("result") or {}
                         phishing_flag = None
                         if isinstance(result, dict):
@@ -431,14 +422,12 @@ def webhook():
         # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
         ca_address = extract_valid_ca(message)
         if ca_address:
-            # 简易去重：同 CA 60 秒内只查一次
             now_ts = time.time()
             cached = _QUERY_CACHE.get(ca_address)
             if cached and now_ts - cached < QUERY_CACHE_TTL:
                 return jsonify({"status": "ok", "cached": True}), 200
             _QUERY_CACHE[ca_address] = now_ts
 
-            # 同步执行：兼容各类部署环境（serverless 环境下后台线程会被回收）
             try:
                 reply_text = get_token_full_info(ca_address)
                 if group_id: send_message("group", group_id, reply_text)
