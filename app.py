@@ -87,8 +87,10 @@ def to_float(v, default=0.0):
 
 
 def fmt_flag(name, value, safe_when="0"):
-    """审计开关：✅=安全，❌=危险。value 为 "0"/"1"。缺数据按安全处理。"""
-    ok = (str(value or "0") == safe_when)
+    """审计开关：✅=安全，❌=危险，➖=数据缺失。value 为 "0"/"1"。"""
+    if value is None or str(value) == "":
+        return f"{name}➖"
+    ok = (str(value) == safe_when)
     return f"{name}{'✅' if ok else '❌'}"
 
 
@@ -236,6 +238,7 @@ def build_evm_lines(info, chain_line, chain_id=None):
         line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
 
     line_audit = ("🛡️ 审计: "
+                  + fmt_flag("开源", info.get("is_open_source"), safe_when="1")
                   + fmt_flag("自毁", info.get("self_destruct"))
                   + fmt_flag("代理", info.get("is_proxy"))
                   + fmt_flag("增发", info.get("is_mintable"))
@@ -244,6 +247,7 @@ def build_evm_lines(info, chain_line, chain_id=None):
                   + fmt_flag("黑名单", info.get("is_blacklisted")))
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
+    if info.get("is_open_source") == "0": risks.append("未开源")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
     # 死控盘只看个人地址（EOA）持仓：合约持仓多为质押池/金库/交易所，不直接算砸盘风险
     if eoa_pct > 80: risks.append("死控盘")
