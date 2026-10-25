@@ -1,8 +1,10 @@
 import os
 import re
 import time
+import hmac
+import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 
@@ -15,7 +17,7 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# ⚠️ 你的专属管理员 ID
+# ⚠️ 你的专属管理员 ID（请确认是 Webhook 推送的真实 from_user_id，而不是邀请链接 code）
 ADMIN_USER_ID = "9410sfdk"
 
 # ===== 地址正则：同时支持 EVM 与 Solana =====
@@ -35,6 +37,11 @@ CHAIN_NAMES = {
 
 # Base58 字符集（用于 Solana 地址严格校验）
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+# ===== 简易查询缓存：同 CA 60 秒内不重复打 API（防刷屏 + 省 GoPlus 额度）=====
+_QUERY_CACHE = {}
+QUERY_CACHE_TTL = 60
+
 
 def is_valid_solana_address(addr):
     if not isinstance(addr, str) or not (32 <= len(addr) <= 44):
@@ -57,8 +64,11 @@ def is_valid_solana_address(addr):
         byte_len = leading_zeros + (num.bit_length() + 7) // 8
     return byte_len == 32
 
+
 def get_beijing_time():
-    return datetime.utcnow() + timedelta(hours=8)
+    # utcnow() 已废弃，改用时区感知写法
+    return datetime.now(timezone(timedelta(hours=8)))
+
 
 def fmt_money(n):
     try:
@@ -66,15 +76,26 @@ def fmt_money(n):
         if n >= 1000000: return f"${n/1000000:.2f}M"
         if n >= 1000: return f"${n/1000:.2f}K"
         return f"${n:.2f}"
-    except:
+    except (TypeError, ValueError):
         return "$0.00"
+
+
+def to_float(v, default=0.0):
+    """安全转 float：None / 空串 / 非数字统一兜底"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
 
 # ================= 运营数据统计系统 =================
 def record_realtime_group(group_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not group_id: return
     try:
         requests.get(f"{UPSTASH_URL}/sadd/all_groups/{group_id}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3)
-    except: pass
+    except Exception as e:
+        print(f"[stats] record_realtime_group 异常: {e}")
+
 
 def record_user_activity(user_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not user_id: return
@@ -90,20 +111,26 @@ def record_user_activity(user_id):
         requests.get(f"{UPSTASH_URL}/sadd/active_daily_{today_str}/{user_id}", headers=headers, timeout=3)
         requests.get(f"{UPSTASH_URL}/sadd/active_weekly_{week_str}/{user_id}", headers=headers, timeout=3)
         requests.get(f"{UPSTASH_URL}/sadd/active_monthly_{month_str}/{user_id}", headers=headers, timeout=3)
-    except: pass
+    except Exception as e:
+        print(f"[stats] record_user_activity 异常: {e}")
+
 
 def get_cardinality(key):
     if not UPSTASH_URL: return 0
     try:
         res = requests.get(f"{UPSTASH_URL}/scard/{key}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3).json()
         return res.get("result", 0)
-    except: return 0
+    except Exception as e:
+        print(f"[stats] get_cardinality({key}) 异常: {e}")
+        return 0
+
 
 def calc_growth(current, previous):
     if previous == 0: return "🟢 +100%" if current > 0 else "0%"
     growth = ((current - previous) / previous) * 100
     icon = "🟢 +" if growth >= 0 else "🔴 "
     return f"{icon}{growth:.1f}%"
+
 
 def get_usage_stats():
     now = get_beijing_time()
@@ -120,7 +147,9 @@ def get_usage_stats():
     try:
         res_q = requests.get(f"{UPSTASH_URL}/get/total_queries", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3).json()
         stats["total_queries"] = int(res_q.get("result") or 0)
-    except: stats["total_queries"] = 0
+    except Exception as e:
+        print(f"[stats] total_queries 异常: {e}")
+        stats["total_queries"] = 0
 
     today_active = get_cardinality(f"active_daily_{today}")
     yesterday_active = get_cardinality(f"active_daily_{yesterday}")
@@ -134,6 +163,7 @@ def get_usage_stats():
     stats["monthly_str"] = f"{this_month_active} 人 (较上月 {calc_growth(this_month_active, last_month_active)})"
     return stats
 
+
 # ================= 核心：查币逻辑 =================
 def get_token_full_info(ca_address):
     if not ca_address.startswith("0x"):
@@ -142,21 +172,28 @@ def get_token_full_info(ca_address):
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     try:
         res = requests.get(dex_url, timeout=5).json()
-        pairs = res.get("pairs", [])
+        pairs = res.get("pairs", []) or []
     except Exception as e:
+        print(f"[query] DexScreener 异常: {e}")
         pairs = []
 
     if not pairs:
         return "🐕‍🦺 嗅探失败：没查到行情数据，可能是极早期盘、假地址，或不在已收录的链上。"
 
-    best_pair = max(pairs, key=lambda x: float(x.get("liquidity", {}).get("usd", 0) if x.get("liquidity") else 0))
+    def liq_of(p):
+        return to_float((p.get("liquidity") or {}).get("usd"))
+
+    def vol_of(p):
+        return to_float((p.get("volume") or {}).get("h24"))
+
+    best_pair = max(pairs, key=liq_of)
     dex_chain = best_pair.get("chainId", "bsc")
     chain_id = CHAIN_MAPPING.get(dex_chain)
     chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
-    fdv = float(best_pair.get("fdv", "0"))
+    fdv = to_float(best_pair.get("fdv"))  # 修复：fdv 可能为 null，原 float(None) 会崩
 
-    total_liq = sum(float(p.get("liquidity", {}).get("usd", 0)) for p in pairs if p.get("liquidity"))
-    total_vol = sum(float(p.get("volume", {}).get("h24", 0)) for p in pairs if p.get("volume"))
+    total_liq = sum(liq_of(p) for p in pairs)
+    total_vol = sum(vol_of(p) for p in pairs)
 
     msg_lines = []
     is_dangerous = False
@@ -176,14 +213,16 @@ def get_token_full_info(ca_address):
         try:
             g_res = requests.get(goplus_url, timeout=5).json()
             if g_res.get("code") == 1 and g_res.get("result"):
-                info = g_res["result"].get(ca_address.lower(), {})
+                info = g_res["result"].get(ca_address.lower(), {}) or {}
                 if not info:
                     msg_lines.append("🛡️ 暂未获取到该合约的安全数据。")
                 else:
                     is_honeypot = info.get("is_honeypot", "0")
-                    buy_tax = float(info.get("buy_tax") or 0) * 100
-                    sell_tax = float(info.get("sell_tax") or 0) * 100
-                    top10_pct = sum(float(h.get("percent") or 0)*100 for h in info.get("holders", [])[:10] if h.get("address","").lower() not in ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"])
+                    buy_tax = to_float(info.get("buy_tax")) * 100
+                    sell_tax = to_float(info.get("sell_tax")) * 100
+                    top10_pct = sum(to_float(h.get("percent")) * 100 for h in (info.get("holders") or [])[:10]
+                                    if (h.get("address", "") or "").lower() not in
+                                    ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"])
 
                     if is_honeypot == "1": risk_reasons.append("貔貅盘（无法卖出）"); is_dangerous = True
                     if buy_tax > 10 or sell_tax > 10: risk_reasons.append(f"高额交易税(买{buy_tax:.1f}%/卖{sell_tax:.1f}%)"); is_dangerous = True
@@ -193,9 +232,9 @@ def get_token_full_info(ca_address):
 
                     total_locked_pct, lock_text_lines = 0.0, []
                     now_ts = int(time.time())
-                    for lp in info.get("lp_holders", []):
+                    for lp in (info.get("lp_holders") or []):
                         if lp.get("is_locked") == 1:
-                            pct = float(lp.get("percent") or 0) * 100
+                            pct = to_float(lp.get("percent")) * 100
                             total_locked_pct += pct
                             end_time_str = ""
                             details = lp.get("locked_detail") or []
@@ -217,6 +256,7 @@ def get_token_full_info(ca_address):
             else:
                 msg_lines.append("🛡️ 安全数据暂时无法获取。")
         except Exception as e:
+            print(f"[query] GoPlus EVM 异常: {e}")
             msg_lines.append("🛡️ 安全数据查询异常。")
 
     header = "🚨 汪汪汪！！（狂吠）报告老板，发现危险目标！\n" if is_dangerous else "🐕 汪！（摇尾巴）嗅探完毕，目前闻起来没毛病：\n"
@@ -228,16 +268,21 @@ def _get_solana_token_info(ca_address):
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     try:
         res = requests.get(dex_url, timeout=5).json()
-        pairs = res.get("pairs", [])
-    except: pairs = []
+        pairs = res.get("pairs", []) or []
+    except Exception as e:
+        print(f"[query] DexScreener SOL 异常: {e}")
+        pairs = []
 
     if not pairs:
         return "🐕‍🦺 嗅探失败：DexScreener 未收录该 Solana 代币，可能是极早期盘、假地址，或池子尚未建立。"
 
-    best_pair = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0))
-    fdv = float(best_pair.get("fdv", "0") or 0)
-    total_liq = sum(float((p.get("liquidity") or {}).get("usd", 0) or 0) for p in pairs)
-    total_vol = sum(float((p.get("volume") or {}).get("h24", 0) or 0) for p in pairs)
+    def liq_of(p):
+        return to_float((p.get("liquidity") or {}).get("usd"))
+
+    best_pair = max(pairs, key=liq_of)
+    fdv = to_float(best_pair.get("fdv"))
+    total_liq = sum(liq_of(p) for p in pairs)
+    total_vol = sum(to_float((p.get("volume") or {}).get("h24")) for p in pairs)
 
     lines = [
         f"📊 市值: {fmt_money(fdv)} | 全链总流动性: {fmt_money(total_liq)} ({len(pairs)}个池子)",
@@ -250,7 +295,7 @@ def _get_solana_token_info(ca_address):
     try:
         g_res = requests.get(goplus_url, timeout=5).json()
         if g_res.get("code") == 1 and g_res.get("result"):
-            info = g_res["result"].get(ca_address, {})
+            info = g_res["result"].get(ca_address, {}) or {}
             if info:
                 mint_status = (info.get("mintable") or {}).get("status", "0")
                 freeze_status = (info.get("freezable") or {}).get("status", "0")
@@ -261,18 +306,20 @@ def _get_solana_token_info(ca_address):
                 if close_status == "1": risks.append("Close 权限未放弃（可关闭账户转移余额）"); is_dangerous = True
 
                 holders = info.get("holders", []) or []
-                top10_pct = sum(float(h.get("percent", 0) or 0) * 100 for h in holders[:10])
+                top10_pct = sum(to_float(h.get("percent")) * 100 for h in holders[:10])
                 if top10_pct > 80: risks.append(f"前10持仓高度集中 ({top10_pct:.1f}%)"); is_dangerous = True
 
                 lines.append(f"🛡️ Mint权限: {'⚠️ 未放弃' if mint_status == '1' else '✅ 已放弃'} | Freeze权限: {'⚠️ 未放弃' if freeze_status == '1' else '✅ 已放弃'}")
                 lines.append(f"👥 前10持仓(估算): {top10_pct:.1f}%")
-    except: pass
+    except Exception as e:
+        print(f"[query] GoPlus SOL 异常: {e}")
 
     if total_liq < 1000: risks.append("流动性极低 (<$1000)"); is_dangerous = True
 
     header = "🚨 汪汪汪！！（狂吠）Solana 目标存在危险信号！\n" if is_dangerous else "🐕 汪！（摇尾巴）Solana 嗅探完毕，权限已放弃，目前闻起来没毛病：\n"
     risk_text = "\n⚠️ 危险提示: " + " | ".join(risks) if risks else ""
     return f"{header}📍 SOL 链数据如下：\n" + "\n".join(lines) + risk_text + "\n\n⚠️ DYOR！"
+
 
 def send_message(chat_type, chat_id, content):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
@@ -283,10 +330,24 @@ def send_message(chat_type, chat_id, content):
     except Exception as e:
         print(f"==== 发送消息异常: {e} ====")
 
+
+def extract_valid_ca(message):
+    """
+    从消息中提取第一个通过校验的 CA 地址。
+    先剔除 URL，避免 URL 路径里的长字符串污染 Base58 匹配。
+    """
+    cleaned = URL_PATTERN.sub(" ", message)
+    for m in CA_PATTERN.finditer(cleaned):
+        addr = m.group()
+        if addr.startswith("0x") or is_valid_solana_address(addr):
+            return addr
+    return None
+
+
 # ================= Webhook 路由 =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
+    if not hmac.compare_digest(request.headers.get("X-API-KEY", ""), WEBHOOK_KEY):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
@@ -326,60 +387,69 @@ def webhook():
                     f"🔸 今日: {stats['daily_str']}\n"
                     f"🔸 本周: {stats['weekly_str']}\n"
                     f"🔸 本月: {stats['monthly_str']}\n\n"
-                    f"*数据更新于 {current_time}*"
+                    f"数据更新于 {current_time}"
                 )
                 send_message("private", from_user_id, admin_msg)
             elif from_user_id:
                 send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限查看哦！")
             return jsonify({"status": "ok"}), 200
 
-        # 🌟 3. 精准防钓鱼检测（提前执行，并使用 GoPlus API）
+        # 3. 精准防钓鱼检测（仅群聊触发）
         match_url = URL_PATTERN.search(message)
         if match_url and group_id:
             url = match_url.group()
             try:
                 domain = urlparse(url).netloc.lower()
                 allowed_domains = ["twitter.com", "x.com", "debox.pro"]
-                # 如果是白名单域名，直接跳过防钓鱼检测
                 is_safe = any(domain == d or domain.endswith("." + d) for d in allowed_domains)
-                
+
                 if not is_safe:
-                    # 调用 GoPlus API 检测
                     try:
                         resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                        # 如果被标记为钓鱼
-                        if resp.get("code") == 1 and (resp.get("result") or {}).get("phishing_site") == 1:
+                        # 兼容 result 直接为 dict 或以 url 为 key 的嵌套 dict，且值可能是 "1"/1
+                        result = resp.get("result") or {}
+                        phishing_flag = None
+                        if isinstance(result, dict):
+                            if result.get("phishing_site") is not None:
+                                phishing_flag = str(result.get("phishing_site"))
+                            else:
+                                for v in result.values():
+                                    if isinstance(v, dict) and v.get("phishing_site") is not None:
+                                        phishing_flag = str(v.get("phishing_site"))
+                                        break
+                        if resp.get("code") == 1 and phishing_flag == "1":
                             reply_text = f"🚨 高危警告：GoPlus 安全库检测到该链接为钓鱼网站！\n🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
                         else:
-                            # 未标记为钓鱼的安全提醒
                             reply_text = f"🐕 安全提示：该链接未在官方白名单内，请群友警惕：\n🌐 域名: {domain}"
                     except Exception:
-                        # API 超时或报错，退回原来的警告
                         reply_text = f"🐕 警告：嗅探到不明链接！\n\n🌐 域名: {domain}\n警犬闻到了钓鱼的风险，请群友警惕，不要随意点击！"
-                    
+
                     send_message("group", group_id, reply_text)
                     return jsonify({"status": "ok"}), 200
-            except: pass
+            except Exception as e:
+                print(f"[phishing] 异常: {e}")
 
-        # 4. 查 CA 风险（只有在未触发防钓鱼 return 的情况下才执行）
-        match_ca = CA_PATTERN.search(message)
-        if match_ca:
-            ca_address = match_ca.group()
+        # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
+        ca_address = extract_valid_ca(message)
+        if ca_address:
+            # 简易去重：同 CA 60 秒内只查一次
+            now_ts = time.time()
+            cached = _QUERY_CACHE.get(ca_address)
+            if cached and now_ts - cached < QUERY_CACHE_TTL:
+                return jsonify({"status": "ok", "cached": True}), 200
+            _QUERY_CACHE[ca_address] = now_ts
 
-            is_valid_ca = False
-            if ca_address.startswith("0x"):
-                is_valid_ca = True
-            elif is_valid_solana_address(ca_address):
-                is_valid_ca = True
-
-            if is_valid_ca:
+            # 异步处理：先立即返回 200，避免 DeBox 回调超时导致重试/重复播报
+            def _query_task():
                 reply_text = get_token_full_info(ca_address)
                 if group_id: send_message("group", group_id, reply_text)
                 elif from_user_id: send_message("private", from_user_id, reply_text)
-
                 record_user_activity(from_user_id)
-                return jsonify({"status": "ok"}), 200
+
+            threading.Thread(target=_query_task, daemon=True).start()
+            return jsonify({"status": "ok"}), 200
 
     return jsonify({"status": "ok"}), 200
+
 
 handler = app
