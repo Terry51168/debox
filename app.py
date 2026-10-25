@@ -2,7 +2,6 @@ import os
 import re
 import time
 import hmac
-import threading
 import requests
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -439,14 +438,14 @@ def webhook():
                 return jsonify({"status": "ok", "cached": True}), 200
             _QUERY_CACHE[ca_address] = now_ts
 
-            # 异步处理：先立即返回 200，避免 DeBox 回调超时导致重试/重复播报
-            def _query_task():
+            # 同步执行：兼容各类部署环境（serverless 环境下后台线程会被回收）
+            try:
                 reply_text = get_token_full_info(ca_address)
                 if group_id: send_message("group", group_id, reply_text)
                 elif from_user_id: send_message("private", from_user_id, reply_text)
                 record_user_activity(from_user_id)
-
-            threading.Thread(target=_query_task, daemon=True).start()
+            except Exception as e:
+                print(f"[query] 查币任务异常: {e}")
             return jsonify({"status": "ok"}), 200
 
     return jsonify({"status": "ok"}), 200
