@@ -3,6 +3,7 @@ import re
 import time
 import hmac
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -180,18 +181,59 @@ def goplus_evm(chain_id, ca_address):
     return {}
 
 
-def build_evm_lines(info, chain_line):
+# 地址分类缓存：合约/EOA 判定结果复用，避免重复打 API
+_ADDR_CACHE = {}
+
+
+def classify_holder(addr, chain_id):
+    """判断持仓地址是否为合约地址（交易所/质押池/金库等通常是合约或平台地址）"""
+    addr = (addr or "").lower()
+    if not addr.startswith("0x"):
+        return {"is_contract": False}
+    if addr in _ADDR_CACHE:
+        return _ADDR_CACHE[addr]
+    try:
+        res = requests.get(
+            f"https://api.gopluslabs.io/api/v1/address_security/{addr}?chain_id={chain_id}",
+            timeout=5).json()
+        info = res.get("result", {}) or {}
+        out = {"is_contract": info.get("is_contract") == "1"}
+    except Exception as e:
+        print(f"[query] address_security 异常: {e}")
+        out = {"is_contract": False}  # 查不到时按个人地址处理，不放大风险
+    _ADDR_CACHE[addr] = out
+    return out
+
+
+def build_evm_lines(info, chain_line, chain_id=None):
     """根据 GoPlus 数据生成税/持仓/锁仓行、审计行、风险标签列表"""
     risks = []
     buy_tax = to_float(info.get("buy_tax")) * 100
     sell_tax = to_float(info.get("sell_tax")) * 100
-    top10_pct = sum(to_float(h.get("percent")) * 100 for h in (info.get("holders") or [])[:10]
-                    if (h.get("address", "") or "").lower() not in
-                    ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"])
+    holders = [(h.get("address", "") or "", to_float(h.get("percent")) * 100)
+               for h in (info.get("holders") or [])[:10]
+               if (h.get("address", "") or "").lower() not in
+               ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"]]
+    top10_pct = sum(pct for _, pct in holders)
     locked_pct = sum(to_float(lp.get("percent")) * 100 for lp in (info.get("lp_holders") or [])
                      if lp.get("is_locked") == 1)
 
-    line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
+    # 细化：前10里拆出合约地址（质押池/金库/交易所等）与个人地址（并行查询不拖慢回复）
+    contract_pct = 0.0
+    if holders and chain_id:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            results = list(ex.map(lambda ap: classify_holder(ap[0], chain_id), holders))
+        contract_pct = sum(pct for (addr, pct), r in zip(holders, results) if r["is_contract"])
+        eoa_pct = top10_pct - contract_pct
+    else:
+        eoa_pct = top10_pct
+
+    if contract_pct > 0:
+        line_tax = (f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}%"
+                    f"(个人 {eoa_pct:.1f}%/合约 {contract_pct:.1f}%) | 🔒 锁仓: {locked_pct:.1f}%")
+    else:
+        line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
+
     line_audit = ("🛡️ 审计: "
                   + fmt_flag("自毁", info.get("self_destruct"))
                   + fmt_flag("代理", info.get("is_proxy"))
@@ -202,7 +244,8 @@ def build_evm_lines(info, chain_line):
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
-    if top10_pct > 80: risks.append("死控盘")
+    # 死控盘只看个人地址（EOA）持仓：合约持仓多为质押池/金库/交易所，不直接算砸盘风险
+    if eoa_pct > 80: risks.append("死控盘")
     if info.get("is_mintable") == "1": risks.append("增发")
     if info.get("is_blacklisted") == "1": risks.append("黑名单")
 
@@ -263,7 +306,7 @@ def get_token_full_info(ca_address):
     if not info:
         return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
 
-    line_tax, line_audit, risks = build_evm_lines(info, chain_line)
+    line_tax, line_audit, risks = build_evm_lines(info, chain_line, chain_id)
     return assemble_report(None, chain_line, [line_tax, line_audit], risks, low_liq)
 
 
