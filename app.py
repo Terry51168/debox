@@ -197,7 +197,8 @@ def classify_holder(addr, chain_id):
             f"https://api.gopluslabs.io/api/v1/address_security/{addr}?chain_id={chain_id}",
             timeout=5).json()
         info = res.get("result", {}) or {}
-        out = {"is_contract": info.get("is_contract") == "1"}
+        # 实测字段名为 contract_address（"1"=合约）；兼容 is_contract 命名
+        out = {"is_contract": info.get("contract_address") == "1" or info.get("is_contract") == "1"}
     except Exception as e:
         print(f"[query] address_security 异常: {e}")
         out = {"is_contract": False}  # 查不到时按个人地址处理，不放大风险
