@@ -18,9 +18,9 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # ⚠️ 你的专属管理员 ID
 ADMIN_USER_ID = "9410sfdk"
 
-# 匹配 0x 和 Solana，以及链接（包含无协议头的裸域名）
+# ===== 地址正则 =====
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
-URL_PATTERN = re.compile(r"https?://[^\s]+|\b[a-zA-Z0-9.-]+\.(?:com|xyz|net|org|io|top|vip|cc|cn|so|me)(?:/[^\s]*)?")
+URL_PATTERN = re.compile(r"https?://[^\s]+")
 
 CHAIN_MAPPING = {
     "ethereum": "1", "bsc": "56", "polygon": "137",
@@ -56,7 +56,7 @@ def fmt_money(n):
         return f"${n:.2f}"
     except: return "$0"
 
-# ================= 豪华后台数据统计 =================
+# ================= 运营数据统计系统 =================
 def record_realtime_group(group_id):
     if not UPSTASH_URL or not UPSTASH_TOKEN or not group_id: return
     try: requests.get(f"{UPSTASH_URL}/sadd/all_groups/{group_id}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3)
@@ -108,20 +108,17 @@ def get_usage_stats():
     stats["monthly_str"] = f"{this_month_active} 人 (较上月 {calc_growth(this_month_active, last_month_active)})"
     return stats
 
-# ================= 极简前端查币（含强行兜底查安全） =================
+# ================= 深度审计查币逻辑 =================
 def get_token_full_info(ca_address):
-    if not ca_address.startswith("0x"): return _get_solana_info(ca_address)
-    return _get_evm_info(ca_address)
+    if not ca_address.startswith("0x"): return _get_solana_token_info(ca_address)
 
-def _get_evm_info(ca_address):
     try: pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}", timeout=5).json().get("pairs", [])
     except: pairs = []
 
     has_dex_data = False
-    chain_id = "56" # 默认按BSC查安全
+    chain_id = "56"
     chain_name = "未知"
-    fdv = 0.0
-    total_liq = 0.0
+    fdv, total_liq, total_vol = 0.0, 0.0, 0.0
 
     if pairs:
         has_dex_data = True
@@ -130,25 +127,22 @@ def _get_evm_info(ca_address):
         chain_name = CHAIN_NAMES.get(chain_id, best_pair.get("chainId", "未知").upper())
         fdv = float(best_pair.get("fdv", "0"))
         total_liq = sum(float(p.get("liquidity", {}).get("usd", 0)) for p in pairs if p.get("liquidity"))
+        total_vol = sum(float(p.get("volume", {}).get("h24", 0)) for p in pairs if p.get("volume"))
 
     is_dangerous = False
     risk_reasons = []
-    
-    tax_str = "0% / 0%"
-    top10_str = "0%"
-    lock_str = "0%"
+    tax_str, top10_str, lock_str = "0% / 0%", "0%", "0%"
     audit_str = "自毁✅ 代理✅ 增发✅ 白名单✅ 暂停✅ 黑名单✅"
 
     if total_liq < 1000 and has_dex_data: 
-        is_dangerous = True
-        risk_reasons.append("池子极小")
+        is_dangerous = True; risk_reasons.append("池子极小")
 
-    # 🌟 无论有没有行情，都强制查安全！
     if chain_id:
         try:
             g_res = requests.get(f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca_address}", timeout=5).json()
             info = g_res.get("result", {}).get(ca_address.lower(), {})
             if info:
+                # 基础风险
                 if info.get("is_honeypot") == "1": is_dangerous = True; risk_reasons.append("貔貅")
                 bt, st = float(info.get("buy_tax") or 0) * 100, float(info.get("sell_tax") or 0) * 100
                 if bt > 10 or st > 10: is_dangerous = True; risk_reasons.append("高税")
@@ -162,7 +156,7 @@ def _get_evm_info(ca_address):
                 if total_locked == 0 and has_dex_data: risk_reasons.append("未锁")
                 lock_str = f"{total_locked:.0f}%"
 
-                # 深度审计
+                # 🌟 深度审计解析
                 is_self = info.get("selfdestruct", {}).get("value") == "1" or info.get("is_selfdestruct") == "1"
                 is_proxy = info.get("is_proxy") == "1"
                 is_mint = info.get("is_mintable") == "1"
@@ -185,8 +179,7 @@ def _get_evm_info(ca_address):
                 else: audit_parts.append("黑名单✅")
                 audit_str = " ".join(audit_parts)
             else:
-                if not has_dex_data:
-                    return "🐕‍🦺 该代币极早期：DexScreener 无行情，GoPlus 也无安全数据。请极度谨慎！"
+                if not has_dex_data: return "🐕‍🦺 该代币极早期：无行情且无安全数据，请极度谨慎！"
         except: pass
 
     header = "🚨 **警犬狂吠！极度危险！**\n" if is_dangerous else "🐕 **警犬摇尾巴！暂未发现风险。**\n"
@@ -204,17 +197,14 @@ def _get_evm_info(ca_address):
             f"🩸 税: {tax_str} | 👥 前10: {top10_str}\n"
             f"🛡️ 审计: {audit_str}\n"
         )
-    
     return f"{header}{body}{conclusion}"
 
-def _get_solana_info(ca_address):
+def _get_solana_token_info(ca_address):
     try: pairs = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}", timeout=5).json().get("pairs", [])
     except: pairs = []
     
     has_dex_data = bool(pairs)
-    fdv = 0.0
-    total_liq = 0.0
-
+    fdv, total_liq = 0.0, 0.0
     if has_dex_data:
         best_pair = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0))
         fdv = float(best_pair.get("fdv", "0") or 0)
@@ -235,8 +225,7 @@ def _get_solana_info(ca_address):
             if t10 > 80: is_dangerous = True; risks.append("死控盘")
             top10 = f"{t10:.1f}%"
         else:
-            if not has_dex_data:
-                return "🐕‍🦺 该代币极早期：DexScreener 无行情，GoPlus 也无安全数据。请极度谨慎！"
+            if not has_dex_data: return "🐕‍🦺 该代币极早期：无行情且无安全数据，请极度谨慎！"
     except: pass
 
     header = "🚨 **警犬狂吠！极度危险！**\n" if is_dangerous else "🐕 **警犬摇尾巴！暂未发现风险。**\n"
@@ -260,7 +249,7 @@ def send_message(chat_type, chat_id, content):
     try: requests.post("https://open.debox.pro/openapi/bot/sendMessage", json={"chat_type": chat_type, "chat_id": chat_id, "content": content, "parse_mode": "text"}, headers={"Content-Type": "application/json", "X-API-KEY": APP_KEY}, timeout=10)
     except: pass
 
-# ================= Webhook 路由 (CA 绝对优先逻辑) =================
+# ================= Webhook 路由 =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if request.headers.get("X-API-KEY", "") != WEBHOOK_KEY:
@@ -270,16 +259,28 @@ def webhook():
     message = data.get("message_raw", data.get("message", ""))
     group_id = data.get("group_id")
     from_user_id = data.get("from_user_id")
-    ca_address = data.get("address")  # 🌟 优先读取 DeBox 卡片地址
+    # 🌟 核心修复：读取 DeBox 卡片自带的地址
+    ca_address = data.get("address")
 
     if group_id: record_realtime_group(group_id)
 
     if message or ca_address:
-        # 1. 后台看板指令（最高优）
+        # 1. 使用教程
+        if message and any(k in message.lower() for k in ["/help", "教程", "菜单", "说明"]):
+            help_text = (
+                "🐕‍🦺 链上警犬使用说明\n\n"
+                "👉 查代币安全：直接在群内发送合约地址，警犬会立刻帮你排雷。\n"
+                "👉 六维合约审计：自动检测自毁、代理、增发、白名单、暂停、黑名单。\n\n"
+                "🔗 体验群链接：https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"
+            )
+            if group_id: send_message("group", group_id, help_text)
+            elif from_user_id: send_message("private", from_user_id, help_text)
+            return jsonify({"status": "ok"}), 200
+
+        # 2. 管理员查后台
         if message and ("/admin" in message or "/stats" in message):
             if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
                 stats = get_usage_stats()
-                current_time = get_beijing_time().strftime('%H:%M')
                 admin_msg = (
                     f"📊 链上警犬 · 实时运营看板\n\n"
                     f"👥 服务群组 (实时): {stats['total_groups']} 个\n"
@@ -289,37 +290,38 @@ def webhook():
                     f"🔸 今日: {stats['daily_str']}\n"
                     f"🔸 本周: {stats['weekly_str']}\n"
                     f"🔸 本月: {stats['monthly_str']}\n\n"
-                    f"*数据更新于 {current_time}*"
+                    f"*数据更新于 {get_beijing_time().strftime('%H:%M')}*"
                 )
                 send_message("private", from_user_id, admin_msg)
             return jsonify({"status": "ok"}), 200
 
-        # 2. 🌟 查 CA（绝对优先，先提取 CA，防止被链接干扰）
+        # 3. 查 CA（优先读取卡片地址，其次正则提取）
         if not ca_address and message:
-            clean_msg = URL_PATTERN.sub("", message) # 剔除链接防误伤
-            match_ca = CA_PATTERN.search(clean_msg)
+            match_ca = CA_PATTERN.search(message)
             if match_ca: ca_address = match_ca.group()
 
         if ca_address:
-            if ca_address.startswith("0x") or is_valid_solana_address(ca_address):
+            is_valid_ca = ca_address.startswith("0x") or is_valid_solana_address(ca_address)
+            if is_valid_ca:
                 reply_text = get_token_full_info(ca_address)
-                send_message("group" if group_id else "private", group_id or from_user_id, reply_text)
+                if group_id: send_message("group", group_id, reply_text)
+                elif from_user_id: send_message("private", from_user_id, reply_text)
                 record_user_activity(from_user_id)
                 return jsonify({"status": "ok"}), 200
 
-        # 3. 防钓鱼（只有在没找到 CA 的情况下才执行）
+        # 4. 精准防钓鱼（放在最后兜底）
         if message and group_id:
-            for m in URL_PATTERN.finditer(message):
-                domain = (urlparse(m.group()).hostname or "").lower()
-                if not domain or any(domain == d or domain.endswith("." + d) for d in ["twitter.com", "x.com", "debox.pro"]): continue
-                
+            match_url = URL_PATTERN.search(message)
+            if match_url:
+                url = match_url.group()
                 try:
-                    resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={m.group()}", timeout=3).json()
-                    if resp.get("code") == 1 and (resp.get("result") or {}).get("phishing_site") == 1:
-                        send_message("group", group_id, f"🚨 **高危拦截！发现钓鱼网站！**\n🌐 `{domain}` \n请不要点击，极易被盗钱包！")
-                        return jsonify({"status": "ok"}), 200
+                    domain = urlparse(url).netloc.lower()
+                    if not any(domain == d or domain.endswith("." + d) for d in ["twitter.com", "x.com", "debox.pro"]):
+                        resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
+                        if resp.get("code") == 1 and (resp.get("result") or {}).get("phishing_site") == 1:
+                            send_message("group", group_id, f"🚨 **高危拦截！发现钓鱼网站！**\n🌐 `{domain}` \n请不要点击，极易被盗钱包！")
+                            return jsonify({"status": "ok"}), 200
                 except: pass
-                continue
 
     return jsonify({"status": "ok"}), 200
 
