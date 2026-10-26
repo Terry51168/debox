@@ -208,8 +208,8 @@ def classify_holder(addr, chain_id):
     return out
 
 
-def build_evm_lines(info, chain_line, chain_id=None):
-    """根据 GoPlus 数据生成税/持仓/锁仓行、审计行、风险标签列表"""
+def build_evm_lines(info, chain_id=None):
+    """根据 GoPlus 数据生成元信息条目、异常审计项、风险标签列表"""
     risks = []
     buy_tax = to_float(info.get("buy_tax")) * 100
     sell_tax = to_float(info.get("sell_tax")) * 100
@@ -218,8 +218,6 @@ def build_evm_lines(info, chain_line, chain_id=None):
                if (h.get("address", "") or "").lower() not in
                ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"]]
     top10_pct = sum(pct for _, pct in holders)
-    locked_pct = sum(to_float(lp.get("percent")) * 100 for lp in (info.get("lp_holders") or [])
-                     if lp.get("is_locked") == 1)
 
     # 细化：前10里拆出合约地址（质押池/金库/交易所等）与个人地址（并行查询不拖慢回复）
     contract_pct = 0.0
@@ -232,55 +230,102 @@ def build_evm_lines(info, chain_line, chain_id=None):
         eoa_pct = top10_pct
 
     if contract_pct > 0:
-        line_tax = (f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}%"
-                    f"(个人 {eoa_pct:.1f}%/合约 {contract_pct:.1f}%) | 🔒 锁仓: {locked_pct:.1f}%")
+        holders_str = f"{top10_pct:.1f}%（个人 {eoa_pct:.1f}% / 合约 {contract_pct:.1f}%）"
     else:
-        line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
+        holders_str = f"{top10_pct:.1f}%"
 
-    # 审计精简：只显示异常项(❌)和未知项(➖)；全绿时不显示审计行，突出重点
-    audit_items = [
-        fmt_flag("开源", info.get("is_open_source"), safe_when="1"),
-        fmt_flag("自毁", info.get("self_destruct")),
-        fmt_flag("代理", info.get("is_proxy")),
-        fmt_flag("藏Owner", info.get("hidden_owner")),
-        fmt_flag("收回权", info.get("can_take_back_ownership")),
-        fmt_flag("改余额", info.get("owner_change_balance")),
-        fmt_flag("增发", info.get("is_mintable")),
-        fmt_flag("白名单", info.get("is_whitelisted")),
-        fmt_flag("暂停", info.get("transfer_pausable")),
-        fmt_flag("黑名单", info.get("is_blacklisted")),
+    meta_items = [
+        ("🩸 税率", f"{buy_tax:.1f}% / {sell_tax:.1f}%"),
+        ("👥 前10", holders_str),
     ]
-    bad_or_unknown = [item for item in audit_items if "✅" not in item]
-    if bad_or_unknown:
-        line_audit = "🛡️ " + " | ".join(bad_or_unknown)
-    else:
-        line_audit = None
+
+    # 审计分级：致命❌ / 可控⚠️ / 未知➖；全绿时不显示审计段落
+    # 致命项：存在即可被利用造成直接损失
+    fatal_defs = [
+        ("开源", info.get("is_open_source"), "1", "未开源"),
+        ("改余额", info.get("owner_change_balance"), "0", "可改余额"),
+        ("藏Owner", info.get("hidden_owner"), "0", "隐藏Owner"),
+        ("收回权", info.get("can_take_back_ownership"), "0", "可收回权限"),
+        ("增发", info.get("is_mintable"), "0", "增发"),
+        ("黑名单", info.get("is_blacklisted"), "0", "黑名单"),
+    ]
+    # 可控项：权限存在但不必然后门，仅提示留意
+    warn_defs = [
+        ("暂停", info.get("transfer_pausable"), "暂停交易"),
+        ("白名单", info.get("is_whitelisted"), "白名单限制"),
+        ("自毁", info.get("self_destruct"), "可自毁"),
+        ("代理", info.get("is_proxy"), "代理合约"),
+    ]
+
+    fatal_items, warn_items, unknown_items = [], [], []
+    for name, val, safe_when, risk_label in fatal_defs:
+        if val is None or str(val) == "":
+            unknown_items.append(name)
+        elif str(val) != safe_when:
+            fatal_items.append(name)
+            risks.append(risk_label)
+    for name, val, warn_label in warn_defs:
+        if val is None or str(val) == "":
+            unknown_items.append(name)
+        elif str(val) == "1":
+            warn_items.append(warn_label)
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
-    if info.get("is_open_source") == "0": risks.append("未开源")
-    if info.get("hidden_owner") == "1": risks.append("隐藏Owner")
-    if info.get("can_take_back_ownership") == "1": risks.append("可收回权限")
-    if info.get("owner_change_balance") == "1": risks.append("可改余额")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
     # 死控盘只看个人地址（EOA）持仓：合约持仓多为质押池/金库/交易所，不直接算砸盘风险
     if eoa_pct > 80: risks.append("死控盘")
-    if info.get("is_mintable") == "1": risks.append("增发")
-    if info.get("is_blacklisted") == "1": risks.append("黑名单")
 
-    return line_tax, line_audit, risks
+    return meta_items, (fatal_items, warn_items, unknown_items), risks
 
-def assemble_report(header, chain_line, lines, risks, low_liq=False):
-    if low_liq: risks = risks + ["流动性极低"]
+
+def risk_level(risks, warn_items, unknown_items):
+    """三级风险定级：red=极高危 / orange=需留意 / green=安全"""
     if risks:
-        lines = [f"🚨 警犬狂吠！极度危险！"] + [chain_line] + lines
-        conclusion = f"❌ 结论：极高风险（{'|'.join(risks)}），千万别碰！ DYOR."
+        return "red"
+    if warn_items or unknown_items:
+        return "orange"
+    return "green"
+
+
+# 最终版式：▰▰▰ 标题 + 纯 ▱▱▱ 分隔线，等级靠 🐕/⚠️/🚨 区分
+LEVEL_STYLE = {
+    "red":    {"title": "▰▰▰ 🚨 链上警犬 · 极度危险 ▰▰▰", "divider": "▱▱▱▱▱▱▱▱▱▱"},
+    "orange": {"title": "▰▰▰ ⚠️ 链上警犬 · 需留意 ▰▰▰",   "divider": "▱▱▱▱▱▱▱▱▱▱"},
+    "green":  {"title": "▰▰▰ 🐕 链上警犬 · 安全报告 ▰▰▰", "divider": "▱▱▱▱▱▱▱▱▱▱"},
+}
+
+
+def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None):
+    """海报式卡片：彩色分级标题 + 图标键值对 + 审计分级段落"""
+    fatal_items, warn_items, unknown_items = audit
+    if low_liq: risks = risks + ["流动性极低"]
+
+    level = risk_level(risks, warn_items, unknown_items)
+    style = LEVEL_STYLE[level]
+
+    if risks:
+        conclusion = f"🚨 极度危险（{'、'.join(risks)}），千万别碰！"
     else:
-        lines = ["🐕 警犬摇尾巴！暂未发现风险。"] + [chain_line] + lines
-        conclusion = "✅ 结论：扫描通过，自行判断。 DYOR."
-    return "\n".join(lines + [conclusion])
+        conclusion = "✅ 扫描通过，自行判断"
+
+    lines = [style["title"]]
+    for label, value in meta_items:
+        lines.append(f"{label}　{value}")
+    lines.append(style["divider"])
+
+    if fatal_items:
+        lines.append(f"❌ 致命　{' | '.join(fatal_items)}")
+    if warn_items:
+        lines.append(f"⚠️ 可控　{' | '.join(warn_items)}")
+    if unknown_items:
+        lines.append(f"➖ 未知　{' | '.join(unknown_items)}")
+
+    lines.append(conclusion)
+    return "\n".join(lines)
 
 
 def get_token_full_info(ca_address):
+    """返回 (报告文本, reply_markup 或 None)"""
     if not ca_address.startswith("0x"):
         return _get_solana_token_info(ca_address)
 
@@ -308,36 +353,39 @@ def get_token_full_info(ca_address):
         dex_chain = best_pair.get("chainId", "bsc")
         chain_id = CHAIN_MAPPING.get(dex_chain)
         chain_name = CHAIN_NAMES.get(chain_id, dex_chain.upper())
-        fdv = to_float(best_pair.get("fdv"))
-        # 优先用真实市值（当前价×流通量），没有再用 FDV（当前价×最大供应量）
-        mcap = to_float(best_pair.get("marketCap")) or fdv
+        symbol = (best_pair.get("baseToken") or {}).get("symbol", "未知")
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True
-        chain_line = f"📍 {chain_name} | 💰 池子: {fmt_money(total_liq)}"
+        # 详情页直达链接（DexScreener 交易对页）
+        dex_page = best_pair.get("url") or dex_url
     else:
         # 无行情（极早期）：遍历支持的链尝试拿到安全数据
-        chain_id, chain_name = None, ""
+        chain_id, chain_name, symbol = None, "", "未知"
         for cid in set(CHAIN_MAPPING.values()):
             info_probe = goplus_evm(cid, ca_address)
             if info_probe:
                 chain_id = cid
                 chain_name = CHAIN_NAMES.get(cid, cid)
                 break
-        chain_line = "📍 未收录行情(极早期) | 安全检测如下"
+
+    meta_items = [("🪙 代币", f"{symbol} · {chain_name or '未知链'}")]
+    if pairs:
+        meta_items.insert(1, ("💰 池子", fmt_money(total_liq)))
 
     if not chain_id:
-        return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
+        return assemble_report(meta_items, ([], [], []), low_liq and ["流动性极低"], low_liq), None
 
     info = goplus_evm(chain_id, ca_address)
     if not info:
-        return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
+        return assemble_report(meta_items, ([], [], []), low_liq and ["流动性极低"], low_liq), None
 
-    line_tax, line_audit, risks = build_evm_lines(info, chain_line, chain_id)
-    report_lines = [line_tax] + ([line_audit] if line_audit else [])
-    return assemble_report(None, chain_line, report_lines, risks, low_liq)
+    meta, audit, risks = build_evm_lines(info, chain_id)
+    meta_items.extend(meta)
+    return assemble_report(meta_items, audit, risks, low_liq, dex_page if pairs else None), None
 
 
 def _get_solana_token_info(ca_address):
+    """返回 (报告文本, reply_markup 或 None)"""
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     pairs = []
     try:
@@ -357,45 +405,51 @@ def _get_solana_token_info(ca_address):
 
     risks = []
     low_liq = False
+    meta_items = [("🪙 代币", "SOL")]
+    dex_page = None
     if pairs:
         best_pair = max(pairs, key=liq_of)
-        fdv = to_float(best_pair.get("fdv"))
-        mcap = to_float(best_pair.get("marketCap")) or fdv
+        symbol = (best_pair.get("baseToken") or {}).get("symbol", "SOL")
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True; risks.append("流动性极低")
-        chain_line = f"📍 SOL | 💰 池子: {fmt_money(total_liq)}"
-    else:
-        chain_line = "📍 未收录行情(极早期) | 安全检测如下"
+        meta_items[0] = ("🪙 代币", f"{symbol} · SOL")
+        meta_items.insert(1, ("💰 池子", fmt_money(total_liq)))
+        dex_page = best_pair.get("url") or dex_url
 
-    lines = []
+    fatal_items, warn_items, unknown_items = [], [], []
     goplus_url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={ca_address}"
     try:
         g_res = requests.get(goplus_url, timeout=5).json()
         if g_res.get("code") == 1 and g_res.get("result"):
             info = g_res["result"].get(ca_address, {}) or {}
             if info:
-                mint_status = (info.get("mintable") or {}).get("status", "0")
-                freeze_status = (info.get("freezable") or {}).get("status", "0")
-                close_status = (info.get("closable") or {}).get("status", "0")
+                mint_status = (info.get("mintable") or {}).get("status", "")
+                freeze_status = (info.get("freezable") or {}).get("status", "")
+                close_status = (info.get("closable") or {}).get("status", "")
                 holders = info.get("holders", []) or []
                 top10_pct = sum(to_float(h.get("percent")) * 100 for h in holders[:10])
 
-                lines.append(f"🛡️ 权限: Mint {'✅' if mint_status != '1' else '❌'} | Freeze {'✅' if freeze_status != '1' else '❌'} | Close {'✅' if close_status != '1' else '❌'}")
-                lines.append(f"👥 前10持仓: {top10_pct:.1f}%")
+                meta_items.append(("👥 前10", f"{top10_pct:.1f}%"))
 
-                if mint_status == "1": risks.append("Mint未放弃")
-                if freeze_status == "1": risks.append("Freeze未放弃")
+                # 分级：Mint/Freeze 可增发/冻结他人资产=致命；Close 仅提示
+                if mint_status == "1": fatal_items.append("Mint未弃"); risks.append("Mint未放弃")
+                elif mint_status == "": unknown_items.append("Mint")
+                if freeze_status == "1": fatal_items.append("Freeze未弃"); risks.append("Freeze未放弃")
+                elif freeze_status == "": unknown_items.append("Freeze")
+                if close_status == "1": warn_items.append("Close未弃")
                 if top10_pct > 80: risks.append("死控盘")
     except Exception as e:
         print(f"[query] GoPlus SOL 异常: {e}")
 
-    return assemble_report(None, chain_line, lines, risks, low_liq)
+    return assemble_report(meta_items, (fatal_items, warn_items, unknown_items), risks, low_liq, dex_page), None
 
 
-def send_message(chat_type, chat_id, content):
+def send_message(chat_type, chat_id, content, reply_markup=None):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
     payload = {"chat_type": chat_type, "chat_id": chat_id, "content": content, "parse_mode": "text"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         requests.post(url, json=payload, headers=headers, timeout=10)
     except Exception as e:
@@ -506,9 +560,9 @@ def webhook():
             _QUERY_CACHE[ca_address] = now_ts
 
             try:
-                reply_text = get_token_full_info(ca_address)
-                if group_id: send_message("group", group_id, reply_text)
-                elif from_user_id: send_message("private", from_user_id, reply_text)
+                reply_text, markup = get_token_full_info(ca_address)
+                if group_id: send_message("group", group_id, reply_text, markup)
+                elif from_user_id: send_message("private", from_user_id, reply_text, markup)
                 record_user_activity(from_user_id)
             except Exception as e:
                 print(f"[query] 查币任务异常: {e}")
