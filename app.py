@@ -208,7 +208,21 @@ def classify_holder(addr, chain_id):
     return out
 
 
-def build_evm_lines(info, chain_id=None):
+# 主流锚定资产白名单（BSC）：这些币的 mint 权限属于交易所官方锚定机制
+# （充值 1:1 铸造），由真实储备背书，不算项目方增发后门
+KNOWN_PEGGED_BSC = {
+    "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c".lower(),  # BTCB
+    "0x2170ed0880ac9a755fd29b2688956bd959f933f8".lower(),  # ETH
+    "0x55d398326f99059ff775485246999027b3197955".lower(),  # USDT
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d".lower(),  # USDC
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56".lower(),  # BUSD
+    "0xc5f0f7b66764f6ec8c0dffba8a602c790a649b89".lower(),  # FDUSD
+    "0x1af3f329e8be154074d8769d06ffa9a48c7a8d55".lower(),  # DAI
+    "0xa2e3356610840701bdf5611a539f8356ca64c141".lower(),  # WBETH
+}
+
+
+def build_evm_lines(info, chain_id=None, ca_address=None):
     """根据 GoPlus 数据生成元信息条目、异常审计项、风险标签列表"""
     risks = []
     buy_tax = to_float(info.get("buy_tax")) * 100
@@ -261,6 +275,9 @@ def build_evm_lines(info, chain_id=None):
 
     fatal_items, warn_items, unknown_items = [], [], []
     for name, val, safe_when, risk_label in fatal_defs:
+        # 主流锚定币的增发是官方锚定机制（充值 1:1 铸造），不算后门，直接跳过
+        if name == "增发" and ca_address and ca_address.lower() in KNOWN_PEGGED_BSC:
+            continue
         if val is None or str(val) == "":
             unknown_items.append(name)
         elif str(val) != safe_when:
@@ -401,7 +418,7 @@ def get_token_full_info(ca_address):
     if not info:
         return assemble_report(meta_items, ([], [], []), [], no_data=True), None
 
-    meta, audit, risks = build_evm_lines(info, chain_id)
+    meta, audit, risks = build_evm_lines(info, chain_id, ca_address)
     meta_items.extend(meta)
     return assemble_report(meta_items, audit, risks, low_liq, dex_page if pairs else None), None
 
