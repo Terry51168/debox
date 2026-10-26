@@ -237,17 +237,24 @@ def build_evm_lines(info, chain_line, chain_id=None):
     else:
         line_tax = f"🩸 税: {buy_tax:.1f}% / {sell_tax:.1f}% | 👥 前10: {top10_pct:.1f}% | 🔒 锁仓: {locked_pct:.1f}%"
 
-    line_audit = ("🛡️ 审计: "
-                  + fmt_flag("开源", info.get("is_open_source"), safe_when="1")
-                  + fmt_flag("自毁", info.get("self_destruct"))
-                  + fmt_flag("代理", info.get("is_proxy"))
-                  + fmt_flag("藏Owner", info.get("hidden_owner"))
-                  + fmt_flag("收回权", info.get("can_take_back_ownership"))
-                  + fmt_flag("改余额", info.get("owner_change_balance"))
-                  + fmt_flag("增发", info.get("is_mintable"))
-                  + fmt_flag("白名单", info.get("is_whitelisted"))
-                  + fmt_flag("暂停", info.get("transfer_pausable"))
-                  + fmt_flag("黑名单", info.get("is_blacklisted")))
+    # 审计精简：只显示异常项(❌)和未知项(➖)；全绿时不显示审计行，突出重点
+    audit_items = [
+        fmt_flag("开源", info.get("is_open_source"), safe_when="1"),
+        fmt_flag("自毁", info.get("self_destruct")),
+        fmt_flag("代理", info.get("is_proxy")),
+        fmt_flag("藏Owner", info.get("hidden_owner")),
+        fmt_flag("收回权", info.get("can_take_back_ownership")),
+        fmt_flag("改余额", info.get("owner_change_balance")),
+        fmt_flag("增发", info.get("is_mintable")),
+        fmt_flag("白名单", info.get("is_whitelisted")),
+        fmt_flag("暂停", info.get("transfer_pausable")),
+        fmt_flag("黑名单", info.get("is_blacklisted")),
+    ]
+    bad_or_unknown = [item for item in audit_items if "✅" not in item]
+    if bad_or_unknown:
+        line_audit = "🛡️ " + " | ".join(bad_or_unknown)
+    else:
+        line_audit = None
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if info.get("is_open_source") == "0": risks.append("未开源")
@@ -261,7 +268,6 @@ def build_evm_lines(info, chain_line, chain_id=None):
     if info.get("is_blacklisted") == "1": risks.append("黑名单")
 
     return line_tax, line_audit, risks
-
 
 def assemble_report(header, chain_line, lines, risks, low_liq=False):
     if low_liq: risks = risks + ["流动性极低"]
@@ -327,7 +333,8 @@ def get_token_full_info(ca_address):
         return assemble_report(None, chain_line, [], low_liq and ["流动性极低"], low_liq)
 
     line_tax, line_audit, risks = build_evm_lines(info, chain_line, chain_id)
-    return assemble_report(None, chain_line, [line_tax, line_audit], risks, low_liq)
+    report_lines = [line_tax] + ([line_audit] if line_audit else [])
+    return assemble_report(None, chain_line, report_lines, risks, low_liq)
 
 
 def _get_solana_token_info(ca_address):
