@@ -287,11 +287,11 @@ def risk_level(risks, warn_items, unknown_items):
     return "green"
 
 
-# 最终版式：▰▰▰ 标题 + 纯 ▱▱▱ 分隔线，等级靠 🐕/⚠️/🚨 区分
+# 最终版式：标题无装饰杠杠，等级靠 🐕/⚠️/🚨 区分
 LEVEL_STYLE = {
-    "red":    {"title": "▰▰▰ 🚨 链上警犬 · 极度危险 ▰▰▰", "divider": "▱▱▱▱▱▱▱▱▱▱"},
-    "orange": {"title": "▰▰▰ ⚠️ 链上警犬 · 需留意 ▰▰▰",   "divider": "▱▱▱▱▱▱▱▱▱▱"},
-    "green":  {"title": "▰▰▰ 🐕 链上警犬 · 安全报告 ▰▰▰", "divider": "▱▱▱▱▱▱▱▱▱▱"},
+    "red":    {"title": "🚨 链上警犬 · 极度危险"},
+    "orange": {"title": "⚠️ 链上警犬 · 需留意"},
+    "green":  {"title": "🐕 链上警犬 · 安全报告"},
 }
 
 
@@ -311,14 +311,20 @@ def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None):
     lines = [style["title"]]
     for label, value in meta_items:
         lines.append(f"{label}　{value}")
-    lines.append(style["divider"])
+    lines.append("▱▱▱▱▱▱▱▱▱▱")
 
+    # 审计按优先级显示：有致命项时只显示致命项（其他项再好，随时可被后门利用，无参考价值）
     if fatal_items:
         lines.append(f"❌ 致命　{' | '.join(fatal_items)}")
-    if warn_items:
-        lines.append(f"⚠️ 可控　{' | '.join(warn_items)}")
-    if unknown_items:
-        lines.append(f"➖ 未知　{' | '.join(unknown_items)}")
+    else:
+        if warn_items:
+            lines.append(f"⚠️ 可控　{' | '.join(warn_items)}")
+        if unknown_items:
+            # 未知项太多时只报数量（新币数据索引中，全列出来是一大坨）
+            if len(unknown_items) > 4:
+                lines.append(f"➖ 未知　{len(unknown_items)} 项（数据索引中）")
+            else:
+                lines.append(f"➖ 未知　{' | '.join(unknown_items)}")
 
     lines.append(conclusion)
     return "\n".join(lines)
@@ -371,6 +377,8 @@ def get_token_full_info(ca_address):
     meta_items = [("🪙 代币", f"{symbol} · {chain_name or '未知链'}")]
     if pairs:
         meta_items.insert(1, ("💰 池子", fmt_money(total_liq)))
+    else:
+        meta_items.insert(1, ("💰 池子", "$0.00"))  # 无池子也显示，用户要求
 
     if not chain_id:
         return assemble_report(meta_items, ([], [], []), low_liq and ["流动性极低"], low_liq), None
@@ -406,14 +414,15 @@ def _get_solana_token_info(ca_address):
     risks = []
     low_liq = False
     meta_items = [("🪙 代币", "SOL")]
+    meta_items.append(("💰 池子", "$0.00"))  # 默认 $0.00，查到池子后覆盖
     dex_page = None
     if pairs:
         best_pair = max(pairs, key=liq_of)
         symbol = (best_pair.get("baseToken") or {}).get("symbol", "SOL")
         total_liq = sum(liq_of(p) for p in pairs)
-        if total_liq < 1000: low_liq = True; risks.append("流动性极低")
+        if total_liq < 1000: low_liq = True  # 流动性极低由 assemble_report 统一追加，避免重复
         meta_items[0] = ("🪙 代币", f"{symbol} · SOL")
-        meta_items.insert(1, ("💰 池子", fmt_money(total_liq)))
+        meta_items[1] = ("💰 池子", fmt_money(total_liq))
         dex_page = best_pair.get("url") or dex_url
 
     fatal_items, warn_items, unknown_items = [], [], []
