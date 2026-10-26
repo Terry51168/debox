@@ -250,10 +250,12 @@ def build_evm_lines(info, chain_id=None):
         ("黑名单", info.get("is_blacklisted"), "0", "黑名单"),
     ]
     # 可控项：权限存在但不必然后门，仅提示留意
+    # 与致命项逻辑不同：数据缺失不算"未知"（缺失≠风险，GoPlus 覆盖不全很常见），
+    # 只有明确查到 "1" 才提示，避免常驻噪音
+    # （致命项必须保留未知栏：如"开源"没查到，无法确认安全，缺失本身就是风险信号）
     warn_defs = [
         ("暂停", info.get("transfer_pausable"), "暂停交易"),
         ("白名单", info.get("is_whitelisted"), "白名单限制"),
-        ("自毁", info.get("self_destruct"), "可自毁"),
         ("代理", info.get("is_proxy"), "代理合约"),
     ]
 
@@ -265,10 +267,12 @@ def build_evm_lines(info, chain_id=None):
             fatal_items.append(name)
             risks.append(risk_label)
     for name, val, warn_label in warn_defs:
-        if val is None or str(val) == "":
-            unknown_items.append(name)
-        elif str(val) == "1":
+        if str(val) == "1":
             warn_items.append(warn_label)
+
+    # 自毁：同可控项逻辑，仅明确查到 "1" 时提示，缺失不进未知栏
+    if str(info.get("self_destruct") or "") == "1":
+        warn_items.append("可自毁")
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
@@ -287,18 +291,28 @@ def risk_level(risks, warn_items, unknown_items):
     return "green"
 
 
-# 最终版式：标题无装饰杠杠，等级靠 🐕/⚠️/🚨 区分
+# 最终版式：标题无装饰杠杠，等级靠 🐕/⚠️/🚨/❓ 区分
 LEVEL_STYLE = {
-    "red":    {"title": "🚨 链上警犬 · 极度危险"},
-    "orange": {"title": "⚠️ 链上警犬 · 需留意"},
-    "green":  {"title": "🐕 链上警犬 · 安全报告"},
+    "red":     {"title": "🚨 链上警犬 · 极度危险"},
+    "orange":  {"title": "⚠️ 链上警犬 · 需留意"},
+    "green":   {"title": "🐕 链上警犬 · 安全报告"},
+    "unknown": {"title": "❓ 链上警犬 · 数据不足"},
 }
 
 
-def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None):
-    """海报式卡片：彩色分级标题 + 图标键值对 + 审计分级段落"""
+def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None, no_data=False):
+    """海报式卡片：分级标题 + 图标键值对 + 审计分级段落；no_data=True 表示安全数据完全查不到"""
     fatal_items, warn_items, unknown_items = audit
     if low_liq: risks = risks + ["流动性极低"]
+
+    if no_data:
+        # 安全数据完全查不到（GoPlus 无此合约），不能装作"扫描通过"误导用户
+        lines = [LEVEL_STYLE["unknown"]["title"]]
+        for label, value in meta_items:
+            lines.append(f"{label}　{value}")
+        lines.append("▱▱▱▱▱▱▱▱▱▱")
+        lines.append("❓ 数据不足，无法判定（可能是未上线的新币，请谨慎）")
+        return "\n".join(lines)
 
     level = risk_level(risks, warn_items, unknown_items)
     style = LEVEL_STYLE[level]
@@ -381,11 +395,11 @@ def get_token_full_info(ca_address):
         meta_items.insert(1, ("💰 池子", "$0.00"))  # 无池子也显示，用户要求
 
     if not chain_id:
-        return assemble_report(meta_items, ([], [], []), low_liq and ["流动性极低"], low_liq), None
+        return assemble_report(meta_items, ([], [], []), [], no_data=True), None
 
     info = goplus_evm(chain_id, ca_address)
     if not info:
-        return assemble_report(meta_items, ([], [], []), low_liq and ["流动性极低"], low_liq), None
+        return assemble_report(meta_items, ([], [], []), [], no_data=True), None
 
     meta, audit, risks = build_evm_lines(info, chain_id)
     meta_items.extend(meta)
