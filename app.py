@@ -307,7 +307,7 @@ def get_token_full_info(ca_address):
         mcap = to_float(best_pair.get("marketCap")) or fdv
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True
-        chain_line = f"📍 {chain_name} | 市值: {fmt_money(mcap)} | 池子: {fmt_money(total_liq)}"
+        chain_line = f"📍 {chain_name} | 💰 池子: {fmt_money(total_liq)}"
     else:
         # 无行情（极早期）：遍历支持的链尝试拿到安全数据
         chain_id, chain_name = None, ""
@@ -356,7 +356,7 @@ def _get_solana_token_info(ca_address):
         mcap = to_float(best_pair.get("marketCap")) or fdv
         total_liq = sum(liq_of(p) for p in pairs)
         if total_liq < 1000: low_liq = True; risks.append("流动性极低")
-        chain_line = f"📍 SOL | 市值: {fmt_money(mcap)} | 池子: {fmt_money(total_liq)}"
+        chain_line = f"📍 SOL | 💰 池子: {fmt_money(total_liq)}"
     else:
         chain_line = "📍 未收录行情(极早期) | 安全检测如下"
 
