@@ -358,7 +358,26 @@ def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None, no_da
                 lines.append(f"➖ 未知　{' | '.join(unknown_items)}")
 
     lines.append(conclusion)
+    # 📢 功能推广提示：跑 1-2 周后删除本行即可收回
+    lines.append("──────\n🐕 新功能：查大户风险请发「查地址 0x钱包地址」")
     return "\n".join(lines)
+
+
+def is_eoa_address(addr):
+    """判断地址是否为个人钱包（非合约）"""
+    try:
+        res = requests.get(
+            f"https://api.gopluslabs.io/api/v1/address_security/{addr.lower()}?chain_id=56",
+            timeout=5).json()
+        return (res.get("result") or {}).get("contract_address") == "0"
+    except Exception:
+        return False
+
+
+# 查不到代币数据时的提示（兼容钱包地址 / 未收录合约两种情况）
+WALLET_HINT = ("❓ 数据不足，查不到代币信息\n"
+               "该地址可能是钱包地址或未收录的合约\n"
+               "🐕 如果是查个人钱包，请发：查地址 {addr}")
 
 
 def get_token_full_info(ca_address):
@@ -411,12 +430,13 @@ def get_token_full_info(ca_address):
     else:
         meta_items.insert(1, ("💰 池子", "$0.00"))  # 无池子也显示，用户要求
 
+    # 查不到代币数据：可能是钱包地址或未收录合约，给出指引
     if not chain_id:
-        return assemble_report(meta_items, ([], [], []), [], no_data=True), None
+        return WALLET_HINT.format(addr=ca_address), None
 
     info = goplus_evm(chain_id, ca_address)
     if not info:
-        return assemble_report(meta_items, ([], [], []), [], no_data=True), None
+        return WALLET_HINT.format(addr=ca_address), None
 
     meta, audit, risks = build_evm_lines(info, chain_id, ca_address)
     meta_items.extend(meta)
@@ -484,6 +504,66 @@ def _get_solana_token_info(ca_address):
     return assemble_report(meta_items, (fatal_items, warn_items, unknown_items), risks, low_liq, dex_page), None
 
 
+# ================= 地址画像（/查地址） =================
+# 地址风险标签定义：GoPlus address_security 字段 → 中文标签
+ADDR_RISK_DEFS = [
+    ("honeypot_related_address", "貔貅盘关联"),
+    ("phishing_activities", "钓鱼活动"),
+    ("stealing_attack", "盗窃攻击"),
+    ("blacklist_doubt", "黑名单疑似"),
+    ("mixer", "混币器"),
+    ("financial_crime", "金融犯罪"),
+    ("money_laundering", "洗钱"),
+    ("cybercrime", "网络犯罪"),
+    ("darkweb_transactions", "暗网交易"),
+    ("blackmail_activities", "敲诈活动"),
+    ("fake_kyc", "虚假KYC"),
+    ("fake_token", "假币发行"),
+    ("sanctioned", "制裁名单"),
+    ("malicious_mining_activities", "恶意挖矿"),
+    ("gas_abuse", "瓦斯滥用"),
+]
+
+
+def get_address_report(addr):
+    """查询单个 EVM 地址的安全画像，返回报告文本"""
+    addr = addr.lower()
+    # 主查 BSC（用户主战场），无数据再试 ETH
+    info = None
+    chain_name = "BSC"
+    for cid, cname in [("56", "BSC"), ("1", "ETH")]:
+        try:
+            res = requests.get(
+                f"https://api.gopluslabs.io/api/v1/address_security/{addr}?chain_id={cid}",
+                timeout=5).json()
+            if res.get("code") == 1 and res.get("result"):
+                info = res["result"]
+                chain_name = cname
+                break
+        except Exception as e:
+            print(f"[addr] address_security({cid}) 异常: {e}")
+    if not info:
+        return ("❓ 链上警犬 · 数据不足\n"
+                f"👤 地址　{addr[:10]}...{addr[-6:]}\n"
+                "▱▱▱▱▱▱▱▱▱▱\n"
+                "❓ 数据不足，无法判定")
+
+    is_contract = info.get("contract_address") == "1"
+    risks = [label for key, label in ADDR_RISK_DEFS if str(info.get(key) or "") == "1"]
+
+    lines = ["🔍 链上警犬 · 地址画像"]
+    lines.append(f"👤 类型　{'合约地址' if is_contract else '个人钱包'} · {chain_name}")
+    if risks:
+        lines.append(f"🏷️ 标签　{'、'.join(risks)}")
+    lines.append("▱▱▱▱▱▱▱▱▱▱")
+    if risks:
+        lines.append(f"🚨 发现 {len(risks)} 项风险记录，谨慎！")
+    else:
+        lines.append("✅ 未发现风险记录，自行判断")
+    return "\n".join(lines)
+
+
+
 def send_message(chat_type, chat_id, content, reply_markup=None):
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
@@ -526,6 +606,7 @@ def webhook():
             help_text = (
                 "🐕‍🦺 链上警犬使用说明\n\n"
                 "👉 查代币安全：直接在群内发送合约地址（支持 EVM 0x 开头 及 Solana Base58 地址），警犬会立刻帮你排雷。\n"
+                "👉 查大户风险：发送「查地址 0x钱包地址」，查这个地址有没有貔貅关联/钓鱼/黑名单等风险记录。\n"
                 "👉 防钓鱼雷达：群内出现不明链接，警犬会自动调用安全接口拦截。\n"
                 "👉 深度数据：自动聚合全链池子，EVM 检测貔貅/税率/锁仓，Solana 检测 Mint/Freeze 权限。\n\n"
                 "💡 觉得好用？点击下方链接加入产品体验群，获取最新功能！\n"
@@ -589,6 +670,21 @@ def webhook():
                     return jsonify({"status": "ok"}), 200
             except Exception as e:
                 print(f"[phishing] 异常: {e}")
+
+        # 3.5 地址画像（/查地址 0x...）：优先于查币分支处理
+        if "查地址" in message:
+            m = re.search(r"0x[a-fA-F0-9]{40}", URL_PATTERN.sub(" ", message))
+            if m:
+                reply_text = get_address_report(m.group())
+                if group_id: send_message("group", group_id, reply_text)
+                elif from_user_id: send_message("private", from_user_id, reply_text)
+                record_user_activity(from_user_id)
+                return jsonify({"status": "ok"}), 200
+            else:
+                help_text = "🐕 用法：发送「查地址 0x开头的钱包地址」\n警犬帮你查这个地址有没有风险记录（支持 EVM 地址）"
+                if group_id: send_message("group", group_id, help_text)
+                elif from_user_id: send_message("private", from_user_id, help_text)
+                return jsonify({"status": "ok"}), 200
 
         # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
         ca_address = extract_valid_ca(message)
