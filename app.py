@@ -405,10 +405,16 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     # 合约地址（交易所/金库/锁仓合约，如币安钱包）→ 正常，不报警
     lp_personal_warn = False
     if lp_holders and lp_locked_pct is None and chain_id:
-        top_lp = max(lp_holders, key=lambda h: to_float(h.get("percent")))
-        top_lp_pct = to_float(top_lp.get("percent")) * 100
-        if top_lp_pct > 50 and not classify_holder(top_lp.get("address", ""), chain_id)["is_contract"]:
-            lp_personal_warn = True
+        # 排除黑洞/零地址：LP 销毁是最安全的状态，不算个人集中
+        burn_addrs = {"0x0000000000000000000000000000000000000000",
+                      "0x000000000000000000000000000000000000dead"}
+        real_lp = [h for h in lp_holders
+                   if (h.get("address", "") or "").lower() not in burn_addrs]
+        if real_lp:
+            top_lp = max(real_lp, key=lambda h: to_float(h.get("percent")))
+            top_lp_pct = to_float(top_lp.get("percent")) * 100
+            if top_lp_pct > 50 and not classify_holder(top_lp.get("address", ""), chain_id)["is_contract"]:
+                lp_personal_warn = True
 
     # 持有人总数：热度数据，与安全无关，不展示（保持报告纯安全视角）
     # holder_count = int(to_float(info.get("holder_count")))
@@ -513,6 +519,8 @@ def assemble_report(meta_items, audit, risks, low_liq=False, dex_url=None, no_da
 
     if risks:
         conclusion = f"🚨 极度危险（{'、'.join(risks)}），千万别碰！"
+    elif warn_items:
+        conclusion = "⚠️ 有需留意的可控项，自行判断"
     else:
         conclusion = "✅ 扫描通过，自行判断"
 
