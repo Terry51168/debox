@@ -129,6 +129,9 @@ def check_domain_lookalike(domain):
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
+# 裸域名（不带 http 前缀）：metamask-io.app、binance-verify.vip 这类
+# 只匹配 .常见TLD 结尾、至少两段的域名，避免把普通英文句子误判
+DOMAIN_PATTERN = re.compile(r"(?<![\w@.\/])((?:[a-zA-Z0-9][a-zA-Z0-9-]*\.)+(?:com|net|org|io|app|xyz|vip|top|cc|me|pro|finance|site|online|info|biz|link|club|fun|ltd|shop|store|tech|zone|page|dev|one|pw|tv|co|ai|cn|us|uk|jp|kr|de|fr|hk|tw|mo|asia|mobi|gov|edu|id|my|sg|in|au))\b")
 
 CHAIN_MAPPING = {
     "ethereum": "1", "bsc": "56", "polygon": "137",
@@ -664,53 +667,56 @@ def webhook():
             return jsonify({"status": "ok"}), 200
 
         # 3. 精准防钓鱼检测（仅群聊触发；静默模式：只有确认钓鱼才报警）
+        # 支持：带协议链接（https://xxx）和裸域名（metamask-io.app）
         match_url = URL_PATTERN.search(message)
-        if match_url and group_id:
-            url = match_url.group()
-            try:
-                domain = urlparse(url).netloc.lower()
-                allowed_domains = ["twitter.com", "x.com", "debox.pro", "t.me", "github.com"]
-                if any(domain == d or domain.endswith("." + d) for d in allowed_domains):
-                    pass  # 已知安全域名，直接放行不吭声
+        _domain_target = None
+        if match_url:
+            _domain_target = urlparse(match_url.group()).netloc.lower()
+        else:
+            m_dom = DOMAIN_PATTERN.search(message)
+            if m_dom:
+                _domain_target = m_dom.group(1).lower()
+        if _domain_target and group_id:
+            domain = _domain_target
+            url = f"https://{domain}"  # 供 GoPlus 查询用
+            allowed_domains = ["twitter.com", "x.com", "debox.pro", "t.me", "github.com"]
+            if not any(domain == d or domain.endswith("." + d) for d in allowed_domains):
+                source = None  # 命中来源
+                # 第1层：本地黑名单（MetaMask + ScamSniffer，毫秒级）
+                if check_domain_in_blocklist(domain):
+                    source = "MetaMask/ScamSniffer 安全库"
                 else:
-                    source = None  # 命中来源
-                    # 第1层：本地黑名单（MetaMask + ScamSniffer，毫秒级）
-                    if check_domain_in_blocklist(domain):
-                        source = "MetaMask/ScamSniffer 安全库"
+                    # 第2层：仿冒域名识别（与主流站点高度相似）
+                    lookalike = check_domain_lookalike(domain)
+                    if lookalike:
+                        source = f"仿冒域名检测（高度疑似 {lookalike} 的仿冒站点）"
                     else:
-                        # 第2层：仿冒域名识别（与主流站点高度相似）
-                        lookalike = check_domain_lookalike(domain)
-                        if lookalike:
-                            source = f"仿冒域名检测（高度疑似 {lookalike} 的仿冒站点）"
-                        else:
-                            # 第3层：GoPlus 实时接口兜底
-                            try:
-                                resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                                result = resp.get("result") or {}
-                                phishing_flag = None
-                                if isinstance(result, dict):
-                                    if result.get("phishing_site") is not None:
-                                        phishing_flag = str(result.get("phishing_site"))
-                                    else:
-                                        for v in result.values():
-                                            if isinstance(v, dict) and v.get("phishing_site") is not None:
-                                                phishing_flag = str(v.get("phishing_site"))
-                                                break
-                                if resp.get("code") == 1 and phishing_flag == "1":
-                                    source = "GoPlus 安全库"
-                            except Exception:
-                                pass  # GoPlus 超时不报警（宁可漏一条也不误报）
+                        # 第3层：GoPlus 实时接口兜底
+                        try:
+                            resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
+                            result = resp.get("result") or {}
+                            phishing_flag = None
+                            if isinstance(result, dict):
+                                if result.get("phishing_site") is not None:
+                                    phishing_flag = str(result.get("phishing_site"))
+                                else:
+                                    for v in result.values():
+                                        if isinstance(v, dict) and v.get("phishing_site") is not None:
+                                            phishing_flag = str(v.get("phishing_site"))
+                                            break
+                            if resp.get("code") == 1 and phishing_flag == "1":
+                                source = "GoPlus 安全库"
+                        except Exception:
+                            pass  # GoPlus 超时不报警（宁可漏一条也不误报）
 
-                    if source:
-                        reply_text = (
-                            f"🚨 高危警告：{source}检测到该链接为钓鱼网站！\n"
-                            f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
-                        )
-                        send_message("group", group_id, reply_text)
-                    # 未命中任何黑名单 → 静默放行，不再刷"未在白名单内"
-                    return jsonify({"status": "ok"}), 200
-            except Exception as e:
-                print(f"[phishing] 异常: {e}")
+                if source:
+                    reply_text = (
+                        f"🚨 高危警告：{source}检测到该链接为钓鱼网站！\n"
+                        f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
+                    )
+                    send_message("group", group_id, reply_text)
+                # 未命中任何黑名单 → 静默放行，不再刷"未在白名单内"
+                return jsonify({"status": "ok"}), 200
 
         # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
         ca_address = extract_valid_ca(message)
