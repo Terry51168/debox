@@ -21,7 +21,7 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 ADMIN_USER_ID = "9410sfdk"
 
 # ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer，24h 刷新） =====
-PHISHING_LIST_TTL = 86400  # 24 小时刷新一次
+PHISHING_LIST_TTL = 3600  # 每小时刷新一次（新钓鱼站最坏 1h 内被覆盖；数据量小，成本可忽略）
 _phishing_list_cache = {"domains": set(), "ts": 0.0, "loaded": False}
 
 def _fetch_lines(url):
@@ -317,18 +317,49 @@ def classify_holder(addr, chain_id):
     return out
 
 
-# 主流锚定资产白名单（BSC）：这些币的 mint 权限属于交易所官方锚定机制
-# （充值 1:1 铸造），由真实储备背书，不算项目方增发后门
-KNOWN_PEGGED_BSC = {
-    "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c".lower(),  # BTCB
-    "0x2170ed0880ac9a755fd29b2688956bd959f933f8".lower(),  # ETH
-    "0x55d398326f99059ff775485246999027b3197955".lower(),  # USDT
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d".lower(),  # USDC
-    "0xe9e7cea3dedca5984780bafc599bd69add087d56".lower(),  # BUSD
-    "0xc5f0f7b66764f6ec8c0dffba8a602c790a649b89".lower(),  # FDUSD
-    "0x1af3f329e8be154074d8769d06ffa9a48c7a8d55".lower(),  # DAI
-    "0xa2e3356610840701bdf5611a539f8356ca64c141".lower(),  # WBETH
+# 主流锚定资产白名单（按链分组）：这些币的 mint 权限属于官方锚定机制
+# （充值 1:1 铸造 / 法币储备），由真实储备背书，不算项目方增发后门
+KNOWN_PEGGED = {
+    "56": {  # BSC
+        "0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c",  # BTCB
+        "0x2170ed0880ac9a755fd29b2688956bd959f933f8",  # ETH
+        "0x55d398326f99059ff775485246999027b3197955",  # USDT
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+        "0xc5f0f7b66764f6ec8c0dffba8a602c790a649b89",  # FDUSD
+        "0x1af3f329e8be154074d8769d06ffa9a48c7a8d55",  # DAI
+        "0xa2e3356610840701bdf5611a539f8356ca64c141",  # WBETH
+    },
+    "1": {   # Ethereum
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+        "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
+    },
+    "137": { # Polygon
+        "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",  # USDT
+        "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",  # USDC
+        "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",  # DAI
+    },
+    "42161": { # Arbitrum
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",  # USDT
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831",  # USDC
+        "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",  # WETH
+    },
+    "8453": { # Base
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+        "0x4200000000000000000000000000000000000006",  # WETH
+    },
+    "10": {  # Optimism
+        "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",  # USDT
+        "0x0b2c639c533813f4aa9d7837caf62653d097ff85",  # USDC
+        "0x4200000000000000000000000000000000000006",  # WETH
+    },
 }
+
+# 兼容旧引用
+KNOWN_PEGGED_BSC = KNOWN_PEGGED.get("56", set())
 
 
 def build_evm_lines(info, chain_id=None, ca_address=None):
@@ -357,10 +388,27 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     else:
         holders_str = f"{top10_pct:.1f}%"
 
+    # LP 锁仓：池子代币（LP）被锁定的比例，未锁 = 项目方可随时撤池跑路
+    lp_locked_pct = None
+    lp_holders = info.get("lp_holders") or []
+    if lp_holders:
+        locked = sum(to_float(h.get("percent")) * 100 for h in lp_holders
+                     if str(h.get("is_locked")) == "1")
+        lp_total = to_float(info.get("lp_total_supply"))
+        if lp_total > 0 and lp_holders:
+            # GoPlus 的 lp_holders.percent 是占 LP 总量百分比
+            lp_locked_pct = min(locked, 100.0)
+
+    # 持有人总数：热度数据，与安全无关，不展示（保持报告纯安全视角）
+    # holder_count = int(to_float(info.get("holder_count")))
+
     meta_items = [
         ("🩸 税率", f"{buy_tax:.1f}% / {sell_tax:.1f}%"),
         ("👥 前10", holders_str),
     ]
+    if lp_locked_pct is not None:
+        icon = "🔒" if lp_locked_pct >= 80 else ("🔓" if lp_locked_pct <= 20 else "⚠️")
+        meta_items.append((f"{icon} LP锁仓", f"{lp_locked_pct:.1f}%"))
 
     # 审计分级：致命❌ / 可控⚠️ / 未知➖；全绿时不显示审计段落
     # 致命项：存在即可被利用造成直接损失
@@ -385,7 +433,8 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     fatal_items, warn_items, unknown_items = [], [], []
     for name, val, safe_when, risk_label in fatal_defs:
         # 主流锚定币的增发是官方锚定机制（充值 1:1 铸造），不算后门，直接跳过
-        if name == "增发" and ca_address and ca_address.lower() in KNOWN_PEGGED_BSC:
+        if name == "增发" and chain_id and ca_address \
+                and ca_address.lower() in KNOWN_PEGGED.get(chain_id, set()):
             continue
         if val is None or str(val) == "":
             unknown_items.append(name)
@@ -399,6 +448,10 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     # 自毁：同可控项逻辑，仅明确查到 "1" 时提示，缺失不进未知栏
     if str(info.get("self_destruct") or "") == "1":
         warn_items.append("可自毁")
+
+    # LP 锁仓过低：项目方可随时撤池，属可控偏高风险
+    if lp_locked_pct is not None and lp_locked_pct <= 20:
+        warn_items.append("LP未锁")
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
