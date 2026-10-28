@@ -69,6 +69,63 @@ def check_domain_in_blocklist(domain):
             return True
     return False
 
+# ===== 仿冒域名识别（typosquatting） =====
+# 主流合法站点清单：骗子常注册与这些站点高度相似的域名
+TRUSTED_BRAND_DOMAINS = [
+    "uniswap.org", "pancakeswap.finance", "sushi.com", "curve.fi",
+    "aave.com", "compound.finance", "lido.fi", "raydium.io",
+    "jup.ag", "orca.so", "metamask.io", "trustwallet.com",
+    "binance.com", "okx.com", "bybit.com", "gate.io",
+    "coinbase.com", "kucoin.com", "bitget.com", "htx.com",
+    "etherenum.org", "ethereum.org", "solana.com", "debox.pro",
+]
+
+def _levenshtein(a, b):
+    """编辑距离（纯 Python 实现，域名短字符串足够快）。"""
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        cur = [i + 1]
+        for j, cb in enumerate(b):
+            cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+# 骗子仿冒域名常用拼接词
+IMPERSONATION_TOKENS = {
+    "app", "io", "official", "login", "exchange", "earn", "verify",
+    "airdrop", "finance", "swap", "wallet", "connect", "pro", "auth",
+    "secure", "support", "team", "site", "online", "vip", "claim",
+    "stake", "launch", "web", "download", "help", "service",
+}
+
+def check_domain_lookalike(domain):
+    """识别与主流站点高度相似的仿冒域名。
+    规则（按 MetaMask fuzzy 思路简化）：
+    - 域名长度 <= 8：编辑距离 1 即报警（短域名错一个字母就很可疑）
+    - 域名长度 9-15：编辑距离 <= 2
+    - 更长域名：编辑距离 <= 2 且长度差 <= 2
+    返回命中的合法域名，未命中返回 None。"""
+    core = domain.split(".")[0]  # 取主域部分比对
+    for brand in TRUSTED_BRAND_DOMAINS:
+        brand_core = brand.split(".")[0]
+        # 完全相同或就是其子域 → 合法，跳过
+        if domain == brand or domain.endswith("." + brand):
+            continue
+        dist = _levenshtein(core, brand_core)
+        limit = 1 if len(brand_core) <= 8 else 2
+        if dist <= limit and abs(len(core) - len(brand_core)) <= 2:
+            return brand
+        # 连字符/拼接仿冒：按分隔符拆词，品牌名是一个词，其余是典型骗子词汇
+        # 如 metamask-io.app、uniswap-exchange.net、okx-earn.vip（纯拼接如 sushiswap 不误伤）
+        tokens = re.split(r"[-_.]", core)
+        if brand_core in tokens and len(tokens) >= 2 and all(
+            t == brand_core or t in IMPERSONATION_TOKENS or t.isdigit() for t in tokens
+        ):
+            return brand
+    return None
+
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
@@ -621,23 +678,28 @@ def webhook():
                     if check_domain_in_blocklist(domain):
                         source = "MetaMask/ScamSniffer 安全库"
                     else:
-                        # 第2层：GoPlus 实时接口兜底
-                        try:
-                            resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                            result = resp.get("result") or {}
-                            phishing_flag = None
-                            if isinstance(result, dict):
-                                if result.get("phishing_site") is not None:
-                                    phishing_flag = str(result.get("phishing_site"))
-                                else:
-                                    for v in result.values():
-                                        if isinstance(v, dict) and v.get("phishing_site") is not None:
-                                            phishing_flag = str(v.get("phishing_site"))
-                                            break
-                            if resp.get("code") == 1 and phishing_flag == "1":
-                                source = "GoPlus 安全库"
-                        except Exception:
-                            pass  # GoPlus 超时不报警（宁可漏一条也不误报）
+                        # 第2层：仿冒域名识别（与主流站点高度相似）
+                        lookalike = check_domain_lookalike(domain)
+                        if lookalike:
+                            source = f"仿冒域名检测（高度疑似 {lookalike} 的仿冒站点）"
+                        else:
+                            # 第3层：GoPlus 实时接口兜底
+                            try:
+                                resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
+                                result = resp.get("result") or {}
+                                phishing_flag = None
+                                if isinstance(result, dict):
+                                    if result.get("phishing_site") is not None:
+                                        phishing_flag = str(result.get("phishing_site"))
+                                    else:
+                                        for v in result.values():
+                                            if isinstance(v, dict) and v.get("phishing_site") is not None:
+                                                phishing_flag = str(v.get("phishing_site"))
+                                                break
+                                if resp.get("code") == 1 and phishing_flag == "1":
+                                    source = "GoPlus 安全库"
+                            except Exception:
+                                pass  # GoPlus 超时不报警（宁可漏一条也不误报）
 
                     if source:
                         reply_text = (
