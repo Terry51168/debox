@@ -20,6 +20,55 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # ⚠️ 你的专属管理员 ID（请确认是 Webhook 推送的真实 from_user_id，而不是邀请链接 code）
 ADMIN_USER_ID = "9410sfdk"
 
+# ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer，24h 刷新） =====
+PHISHING_LIST_TTL = 86400  # 24 小时刷新一次
+_phishing_list_cache = {"domains": set(), "ts": 0.0, "loaded": False}
+
+def _fetch_lines(url):
+    try:
+        res = requests.get(url, timeout=8)
+        return res.text.splitlines()
+    except Exception:
+        return []
+
+def get_phishing_blocklist():
+    """合并 MetaMask eth-phishing-detect 与 ScamSniffer 开源黑名单。
+    拉取失败时保留旧缓存，绝不因数据源故障而漏报已确认的钓鱼站。"""
+    now = time.time()
+    if _phishing_list_cache["loaded"] and now - _phishing_list_cache["ts"] < PHISHING_LIST_TTL:
+        return _phishing_list_cache["domains"]
+    domains = set()
+    # MetaMask 官方钓鱼域名库（19.8万+）
+    try:
+        res = requests.get("https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/main/src/data.json", timeout=8)
+        import json as _json
+        data = res.json()
+        domains.update(d.lower() for d in (data.get("blacklist") or []))
+    except Exception:
+        pass
+    # ScamSniffer 开源黑名单（25万+，分钟级更新）
+    for line in _fetch_lines("https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains/list.txt"):
+        line = line.strip().lower()
+        if line and not line.startswith("#"):
+            domains.add(line)
+    if domains:  # 只有拉到了新数据才更新缓存
+        _phishing_list_cache.update({"domains": domains, "ts": now, "loaded": True})
+        print(f"[phishing] 黑名单已加载 {len(domains)} 个域名")
+    return _phishing_list_cache["domains"]
+
+def check_domain_in_blocklist(domain):
+    """精确匹配 + 子域匹配（如 evil.uniswap.com 命中 uniswap.com 的变体子域）。"""
+    bl = get_phishing_blocklist()
+    if not bl:
+        return False
+    if domain in bl:
+        return True
+    parts = domain.split(".")
+    for i in range(1, len(parts) - 1):
+        if ".".join(parts[i:]) in bl:
+            return True
+    return False
+
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
@@ -557,36 +606,46 @@ def webhook():
                 send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限查看哦！")
             return jsonify({"status": "ok"}), 200
 
-        # 3. 精准防钓鱼检测（仅群聊触发）
+        # 3. 精准防钓鱼检测（仅群聊触发；静默模式：只有确认钓鱼才报警）
         match_url = URL_PATTERN.search(message)
         if match_url and group_id:
             url = match_url.group()
             try:
                 domain = urlparse(url).netloc.lower()
-                allowed_domains = ["twitter.com", "x.com", "debox.pro"]
-                is_safe = any(domain == d or domain.endswith("." + d) for d in allowed_domains)
+                allowed_domains = ["twitter.com", "x.com", "debox.pro", "t.me", "github.com"]
+                if any(domain == d or domain.endswith("." + d) for d in allowed_domains):
+                    pass  # 已知安全域名，直接放行不吭声
+                else:
+                    source = None  # 命中来源
+                    # 第1层：本地黑名单（MetaMask + ScamSniffer，毫秒级）
+                    if check_domain_in_blocklist(domain):
+                        source = "MetaMask/ScamSniffer 安全库"
+                    else:
+                        # 第2层：GoPlus 实时接口兜底
+                        try:
+                            resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
+                            result = resp.get("result") or {}
+                            phishing_flag = None
+                            if isinstance(result, dict):
+                                if result.get("phishing_site") is not None:
+                                    phishing_flag = str(result.get("phishing_site"))
+                                else:
+                                    for v in result.values():
+                                        if isinstance(v, dict) and v.get("phishing_site") is not None:
+                                            phishing_flag = str(v.get("phishing_site"))
+                                            break
+                            if resp.get("code") == 1 and phishing_flag == "1":
+                                source = "GoPlus 安全库"
+                        except Exception:
+                            pass  # GoPlus 超时不报警（宁可漏一条也不误报）
 
-                if not is_safe:
-                    try:
-                        resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                        result = resp.get("result") or {}
-                        phishing_flag = None
-                        if isinstance(result, dict):
-                            if result.get("phishing_site") is not None:
-                                phishing_flag = str(result.get("phishing_site"))
-                            else:
-                                for v in result.values():
-                                    if isinstance(v, dict) and v.get("phishing_site") is not None:
-                                        phishing_flag = str(v.get("phishing_site"))
-                                        break
-                        if resp.get("code") == 1 and phishing_flag == "1":
-                            reply_text = f"🚨 高危警告：GoPlus 安全库检测到该链接为钓鱼网站！\n🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
-                        else:
-                            reply_text = f"🐕 安全提示：该链接未在官方白名单内，请群友警惕：\n🌐 域名: {domain}"
-                    except Exception:
-                        reply_text = f"🐕 警告：嗅探到不明链接！\n\n🌐 域名: {domain}\n警犬闻到了钓鱼的风险，请群友警惕，不要随意点击！"
-
-                    send_message("group", group_id, reply_text)
+                    if source:
+                        reply_text = (
+                            f"🚨 高危警告：{source}检测到该链接为钓鱼网站！\n"
+                            f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
+                        )
+                        send_message("group", group_id, reply_text)
+                    # 未命中任何黑名单 → 静默放行，不再刷"未在白名单内"
                     return jsonify({"status": "ok"}), 200
             except Exception as e:
                 print(f"[phishing] 异常: {e}")
