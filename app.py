@@ -296,6 +296,30 @@ def goplus_evm(chain_id, ca_address):
 _ADDR_CACHE = {}
 
 
+# 公共 RPC 端点（用于 eth_getCode 验证地址是否为合约，GoPlus 无索引时的兜底）
+RPC_ENDPOINTS = {
+    "1":    ["https://ethereum-rpc.publicnode.com", "https://eth.llamarpc.com"],
+    "56":   ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.binance.org"],
+    "137":  ["https://polygon-bor-rpc.publicnode.com"],
+    "42161":["https://arbitrum-one-rpc.publicnode.com"],
+    "8453": ["https://base-rpc.publicnode.com"],
+    "10":   ["https://optimism-rpc.publicnode.com"],
+}
+
+def is_contract_via_rpc(addr, chain_id):
+    """链上终极验证：eth_getCode 有代码 = 合约。数据来自节点，不依赖任何索引商。"""
+    for rpc in RPC_ENDPOINTS.get(str(chain_id), []):
+        try:
+            res = requests.post(rpc, json={
+                "jsonrpc": "2.0", "id": 1, "method": "eth_getCode",
+                "params": [addr, "latest"]
+            }, timeout=5).json()
+            code = (res.get("result") or "0x")
+            return code != "0x"  # 有代码 → 合约
+        except Exception:
+            continue
+    return None  # 所有节点都失败 → 无法判定
+
 def classify_holder(addr, chain_id):
     """判断持仓地址是否为合约地址（交易所/质押池/金库等通常是合约或平台地址）"""
     addr = (addr or "").lower()
@@ -309,7 +333,14 @@ def classify_holder(addr, chain_id):
             timeout=5).json()
         info = res.get("result", {}) or {}
         # 实测字段名为 contract_address（"1"=合约）；兼容 is_contract 命名
-        out = {"is_contract": info.get("contract_address") == "1" or info.get("is_contract") == "1"}
+        is_contract = info.get("contract_address") == "1" or info.get("is_contract") == "1"
+        # 关键补刀：GoPlus 无索引数据时（data_source 为空），"0"只是默认值不可信，
+        # 必须用链上 eth_getCode 验证——V3 池子合约等未索引地址全靠这步洗清冤屈
+        if not is_contract and not info.get("data_source"):
+            rpc_result = is_contract_via_rpc(addr, chain_id)
+            if rpc_result is not None:
+                is_contract = rpc_result
+        out = {"is_contract": is_contract}
     except Exception as e:
         print(f"[query] address_security 异常: {e}")
         out = {"is_contract": False}  # 查不到时按个人地址处理，不放大风险
@@ -448,6 +479,39 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     ]
 
     fatal_items, warn_items, unknown_items = [], [], []
+
+    # 创建者/Owner 背景核查：合约可以写得干净，但惯犯开的合约一票否决
+    # 检查 creator_address 与 owner_address 的恶意前科（钓鱼/盗窃/网诈/洗钱）
+    MALICIOUS_FLAGS = ["phishing_activities", "stealing_attack",
+                       "cybercrime", "money_laundering", "blackmail_activities"]
+    suspicious_roles = []
+    for role, role_addr in (("创建者", info.get("creator_address")),
+                            ("Owner", info.get("owner_address"))):
+        ra = (role_addr or "").lower()
+        if not ra.startswith("0x"):
+            continue
+        cached = _ADDR_CACHE.get(ra) or {}
+        if "flags" in cached:
+            bad_flags = cached["flags"]
+        else:
+            bad_flags = []
+            try:
+                res = requests.get(
+                    f"https://api.gopluslabs.io/api/v1/address_security/{ra}?chain_id={chain_id}",
+                    timeout=5).json()
+                rinfo = res.get("result", {}) or {}
+                if rinfo.get("data_source"):  # 有真实索引数据才采信，默认值不算数
+                    bad_flags = [f for f in MALICIOUS_FLAGS if str(rinfo.get(f)) == "1"]
+            except Exception:
+                bad_flags = []
+            _ADDR_CACHE[ra] = {**cached, "is_contract": cached.get("is_contract", False),
+                               "flags": bad_flags}
+        if bad_flags:
+            suspicious_roles.append(f"{role}涉黑")
+    if suspicious_roles:
+        fatal_items.extend(suspicious_roles)
+        risks.append("创建者有前科")
+
     for name, val, safe_when, risk_label in fatal_defs:
         # 主流锚定币的增发是官方锚定机制（充值 1:1 铸造），不算后门，直接跳过
         if name == "增发" and chain_id and ca_address \
