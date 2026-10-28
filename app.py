@@ -388,16 +388,27 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     else:
         holders_str = f"{top10_pct:.1f}%"
 
-    # LP 锁仓：池子代币（LP）被锁定的比例，未锁 = 项目方可随时撤池跑路
+    # LP 锁仓：池子代币（LP）被锁定的比例。
+    # 注意：交易所官方流动性（BTCB）与 V3 集中流动性（PancakeSwap V3）不走锁仓合约，
+    # is_locked 全为 0 但并非"可撤池跑路"，0% 一律视为"无法判定"，不显示不报警，
+    # 只有明确检测到锁仓记录（>0%）才据此展示与判断，避免冤枉主流币。
     lp_locked_pct = None
     lp_holders = info.get("lp_holders") or []
     if lp_holders:
         locked = sum(to_float(h.get("percent")) * 100 for h in lp_holders
                      if str(h.get("is_locked")) == "1")
-        lp_total = to_float(info.get("lp_total_supply"))
-        if lp_total > 0 and lp_holders:
-            # GoPlus 的 lp_holders.percent 是占 LP 总量百分比
+        if locked > 0:
             lp_locked_pct = min(locked, 100.0)
+
+    # 盲区补刀：锁仓记录全 0 时，查 LP 最大持有者身份。
+    # 个人地址(EOA)独占大额 LP = 项目方可随时撤池 → 报"LP集中个人"；
+    # 合约地址（交易所/金库/锁仓合约，如币安钱包）→ 正常，不报警
+    lp_personal_warn = False
+    if lp_holders and lp_locked_pct is None and chain_id:
+        top_lp = max(lp_holders, key=lambda h: to_float(h.get("percent")))
+        top_lp_pct = to_float(top_lp.get("percent")) * 100
+        if top_lp_pct > 50 and not classify_holder(top_lp.get("address", ""), chain_id)["is_contract"]:
+            lp_personal_warn = True
 
     # 持有人总数：热度数据，与安全无关，不展示（保持报告纯安全视角）
     # holder_count = int(to_float(info.get("holder_count")))
@@ -452,6 +463,10 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     # LP 锁仓过低：项目方可随时撤池，属可控偏高风险
     if lp_locked_pct is not None and lp_locked_pct <= 20:
         warn_items.append("LP未锁")
+
+    # LP 集中在个人地址：无锁仓记录但 LP 握在项目方个人钱包里，随时可撤
+    if lp_personal_warn:
+        warn_items.append("LP集中个人")
 
     if info.get("is_honeypot") == "1": risks.append("貔貅")
     if buy_tax > 10 or sell_tax > 10: risks.append("高税")
