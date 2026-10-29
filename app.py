@@ -20,6 +20,9 @@ UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # ⚠️ 你的专属管理员 ID（请确认是 Webhook 推送的真实 from_user_id，而不是邀请链接 code）
 ADMIN_USER_ID = "9410sfdk"
 
+# 商务合作联系方式（/ 商务 指令展示给客户看）——改成你自己的 DeBox ID / 微信号
+CONTACT_INFO = "DeBox：@51168"
+
 # ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer，24h 刷新） =====
 PHISHING_LIST_TTL = 3600  # 每小时刷新一次（新钓鱼站最坏 1h 内被覆盖；数据量小，成本可忽略）
 _phishing_list_cache = {"domains": set(), "ts": 0.0, "loaded": False}
@@ -398,10 +401,13 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     risks = []
     buy_tax = to_float(info.get("buy_tax")) * 100
     sell_tax = to_float(info.get("sell_tax")) * 100
-    holders = [(h.get("address", "") or "", to_float(h.get("percent")) * 100)
-               for h in (info.get("holders") or [])[:10]
-               if (h.get("address", "") or "").lower() not in
-               ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"]]
+    BURN_ADDRS = {"0x0000000000000000000000000000000000000000",
+                  "0x000000000000000000000000000000000000dead"}
+    raw_holders = [(h.get("address", "") or "", to_float(h.get("percent")) * 100)
+                   for h in (info.get("holders") or [])[:10]]
+    # 前置口径：前10 一律剔除销毁/黑洞地址后再统计（销毁份额不属于任何人，算进集中度会虚高）
+    holders = [(addr, pct) for addr, pct in raw_holders if addr.lower() not in BURN_ADDRS]
+    burn_pct = sum(pct for addr, pct in raw_holders if addr.lower() in BURN_ADDRS)
     top10_pct = sum(pct for _, pct in holders)
 
     # 细化：前10里拆出合约地址（质押池/金库/交易所等）与个人地址（并行查询不拖慢回复）
@@ -414,10 +420,11 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     else:
         eoa_pct = top10_pct
 
+    # 版式：集中度（已剔除销毁）｜拆出个人与合约两栏
     if contract_pct > 0:
         holders_str = f"{top10_pct:.1f}%（个人 {eoa_pct:.1f}% / 合约 {contract_pct:.1f}%）"
     else:
-        holders_str = f"{top10_pct:.1f}%"
+        holders_str = f"{top10_pct:.1f}%（个人 {eoa_pct:.1f}%）"
 
     # LP 锁仓：池子代币（LP）被锁定的比例。
     # 注意：交易所官方流动性（BTCB）与 V3 集中流动性（PancakeSwap V3）不走锁仓合约，
@@ -717,7 +724,12 @@ def _get_solana_token_info(ca_address):
                 freeze_status = (info.get("freezable") or {}).get("status", "")
                 close_status = (info.get("closable") or {}).get("status", "")
                 holders = info.get("holders", []) or []
-                top10_pct = sum(to_float(h.get("percent")) * 100 for h in holders[:10])
+                # 与 EVM 口径一致：剔除销毁/黑洞后再统计，避免销毁份额虚抬集中度
+                _burn = {"0x0000000000000000000000000000000000000000",
+                         "0x000000000000000000000000000000000000dead",
+                         "1nc1nerator11111111111111111111111111111111"}
+                top10_pct = sum(to_float(h.get("percent")) * 100 for h in holders[:10]
+                                if (h.get("address", "") or "").lower() not in _burn)
 
                 meta_items.append(("👥 前10", f"{top10_pct:.1f}%"))
 
@@ -804,6 +816,81 @@ def webhook():
                 send_message("private", from_user_id, admin_msg)
             elif from_user_id:
                 send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限查看哦！")
+            return jsonify({"status": "ok"}), 200
+
+        # 2.5 查询自己的用户 ID（用于确认 ADMIN_USER_ID 配置是否正确）
+        if "/whoami" in message or "/我的id" in message:
+            if from_user_id:
+                is_admin = str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}"
+                send_message("private", from_user_id,
+                             f"🪪 你的用户 ID\n\n"
+                             f"ID: {from_user_id}\n"
+                             f"群聊 ID: {group_id or '（私聊无）'}\n"
+                             f"管理员权限: {'✅ 是' if is_admin else '❌ 否'}\n\n"
+                             f"当前配置的 ADMIN_USER_ID: {ADMIN_USER_ID}")
+            return jsonify({"status": "ok"}), 200
+
+        # 2.6 商务合作入口（覆盖数据实时读取，联系方式取 CONTACT_INFO）
+        if "/商务" in message or "/合作" in message:
+            try:
+                _g = get_cardinality("all_groups")
+                _u = get_cardinality("all_users")
+                cover_str = f"覆盖 {_g} 个币圈社群 · {_u}+ 精准用户" if _g else "覆盖多个币圈社群 · 精准用户"
+            except Exception:
+                cover_str = "覆盖多个币圈社群 · 精准用户"
+            biz_text = (
+                "💼 链上警犬 · 广告合作\n\n"
+                "📢 群内广告投放\n"
+                f"   {cover_str}\n"
+                "   币圈真实用户，非机器人刷量\n"
+                "   面向：项目方 / 交易所 / 工具 / KOL\n\n"
+                "📌 联系管理员\n"
+                f"   {CONTACT_INFO}\n\n"
+                "⚠️ 所有内容标注「📢 推广」\n"
+                "   警犬不接受貔貅盘/资金盘/无审计野鸡盘\n"
+                "   接单前会用警犬先自查项目"
+            )
+            send_message("private" if not group_id else "group",
+                         from_user_id if not group_id else group_id, biz_text)
+            return jsonify({"status": "ok"}), 200
+
+        # 2.7 管理员群发（商务推广交付）：/群发 文案内容
+        if message.startswith("/群发"):
+            if str(from_user_id) == ADMIN_USER_ID or str(from_user_id) == f"@{ADMIN_USER_ID}":
+                ad_text = message[len("/群发"):].strip()
+                if not ad_text:
+                    send_message("private", from_user_id,
+                                 "📢 用法：/群发 文案内容\n\n"
+                                 "示例：/群发 XX交易所新用户注册送100U https://xxx\n\n"
+                                 "⚠️ 消息将自动携带「📢 推广」标识，逐群发送并限速")
+                    return jsonify({"status": "ok"}), 200
+                group_ids = []
+                try:
+                    res = requests.get(f"{UPSTASH_URL}/smembers/all_groups",
+                                       headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+                                       timeout=5).json()
+                    group_ids = res.get("result") or []
+                except Exception as e:
+                    print(f"[群发] 拉取群列表失败: {e}")
+                if not group_ids:
+                    send_message("private", from_user_id, "❌ 群列表为空，无法群发")
+                    return jsonify({"status": "ok"}), 200
+                ok_cnt, fail_cnt = 0, 0
+                payload = f"📢 推广\n\n{ad_text}"
+                for gid in group_ids:
+                    try:
+                        send_message("group", gid, payload)
+                        ok_cnt += 1
+                    except Exception:
+                        fail_cnt += 1
+                    time.sleep(0.6)
+                send_message("private", from_user_id,
+                             f"✅ 群发完成\n\n"
+                             f"📤 成功: {ok_cnt} 个群\n"
+                             f"❌ 失败: {fail_cnt} 个群\n"
+                             f"📋 文案: {ad_text[:50]}{'...' if len(ad_text) > 50 else ''}")
+            elif from_user_id:
+                send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限使用哦！")
             return jsonify({"status": "ok"}), 200
 
         # 3. 精准防钓鱼检测（仅群聊触发；静默模式：只有确认钓鱼才报警）
