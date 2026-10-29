@@ -22,6 +22,8 @@ ADMIN_USER_ID = "9410sfdk"
 
 # 商务合作联系方式（/ 商务 指令展示给客户看）——改成你自己的 DeBox ID / 微信号
 CONTACT_INFO = "DeBox：@51168"
+# 「联系管理员」按钮跳转链接（DeBox 名片页，点击直达主页可发起私聊）
+CONTACT_URL = "https://m.debox.pro/card?id=9410sfdk&invite_code=9410sfdk"
 
 # ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer，24h 刷新） =====
 PHISHING_LIST_TTL = 3600  # 每小时刷新一次（新钓鱼站最坏 1h 内被覆盖；数据量小，成本可忽略）
@@ -746,16 +748,33 @@ def _get_solana_token_info(ca_address):
     return assemble_report(meta_items, (fatal_items, warn_items, unknown_items), risks, low_liq, dex_page), None
 
 
-def send_message(chat_type, chat_id, content, reply_markup=None):
+def send_message(chat_type, chat_id, content, reply_markup=None, raise_on_error=False):
+    """返回 True=成功；失败时记录日志，raise_on_error=True 则抛出异常供群发统计"""
     url = "https://open.debox.pro/openapi/bot/sendMessage"
     headers = {"Content-Type": "application/json", "X-API-KEY": APP_KEY}
     payload = {"chat_type": chat_type, "chat_id": chat_id, "content": content, "parse_mode": "text"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        # 关键：HTTP 200 但业务失败（无权限/不在群）必须按失败处理，不能一律算成功
+        if res.status_code != 200:
+            raise RuntimeError(f"HTTP {res.status_code}: {res.text[:150]}")
+        body = {}
+        try:
+            body = res.json()
+        except Exception:
+            pass
+        # DeBox 成功一般返回 code=0/200 或 success=true；有明确失败标识则判失败
+        code = body.get("code", body.get("errcode", 0))
+        if str(code) not in ("0", "200", "None") or body.get("success") is False or body.get("error"):
+            raise RuntimeError(f"业务失败: {res.text[:150]}")
+        return True
     except Exception as e:
-        print(f"==== 发送消息异常: {e} ====")
+        print(f"==== 发送消息失败 chat={chat_id}: {e} ====")
+        if raise_on_error:
+            raise
+        return False
 
 
 def extract_valid_ca(message):
@@ -844,14 +863,20 @@ def webhook():
                 f"   {cover_str}\n"
                 "   币圈真实用户，非机器人刷量\n"
                 "   面向：项目方 / 交易所 / 工具 / KOL\n\n"
-                "📌 联系管理员\n"
-                f"   {CONTACT_INFO}\n\n"
+                f"📌 联系管理员：{CONTACT_INFO}\n\n"
                 "⚠️ 所有内容标注「📢 推广」\n"
                 "   警犬不接受貔貅盘/资金盘/无审计野鸡盘\n"
                 "   接单前会用警犬先自查项目"
             )
+            # 按钮直跳管理员 DeBox 名片（点击即打开主页，可发起私聊）
+            biz_markup = {
+                "inline_buttons": [
+                    [{"text": "👤 联系管理员", "url": CONTACT_URL}]
+                ]
+            }
             send_message("private" if not group_id else "group",
-                         from_user_id if not group_id else group_id, biz_text)
+                         from_user_id if not group_id else group_id,
+                         biz_text, reply_markup=biz_markup)
             return jsonify({"status": "ok"}), 200
 
         # 2.7 管理员群发（商务推广交付）：/群发 文案内容
@@ -875,20 +900,38 @@ def webhook():
                 if not group_ids:
                     send_message("private", from_user_id, "❌ 群列表为空，无法群发")
                     return jsonify({"status": "ok"}), 200
+                # 先把回执发给管理员：即使用户没收到，后台日志也能查到卡在哪一步
+                send_message("private", from_user_id,
+                             f"📤 群发已启动\n\n"
+                             f"🎯 目标群数: {len(group_ids)} 个\n"
+                             f"⏱ 预计耗时: 约 {len(group_ids) * 0.6:.0f} 秒\n\n"
+                             f"完成后会再发一条结果给你")
+
                 ok_cnt, fail_cnt = 0, 0
+                failed_ids = []
                 payload = f"📢 推广\n\n{ad_text}"
                 for gid in group_ids:
                     try:
-                        send_message("group", gid, payload)
+                        send_message("group", gid, payload, raise_on_error=True)
                         ok_cnt += 1
-                    except Exception:
+                    except Exception as e:
                         fail_cnt += 1
+                        failed_ids.append(f"{gid}（{str(e)[:40]}）")
                     time.sleep(0.6)
-                send_message("private", from_user_id,
-                             f"✅ 群发完成\n\n"
-                             f"📤 成功: {ok_cnt} 个群\n"
-                             f"❌ 失败: {fail_cnt} 个群\n"
-                             f"📋 文案: {ad_text[:50]}{'...' if len(ad_text) > 50 else ''}")
+
+                result_msg = (
+                    f"{'✅' if fail_cnt == 0 else '⚠️'} 群发完成\n\n"
+                    f"🎯 目标群数: {len(group_ids)} 个\n"
+                    f"📤 成功: {ok_cnt} 个群\n"
+                    f"❌ 失败: {fail_cnt} 个群\n"
+                )
+                if failed_ids:
+                    result_msg += "\n失败明细:\n" + "\n".join(f"· {x}" for x in failed_ids[:10])
+                    if len(failed_ids) > 10:
+                        result_msg += f"\n· 另有 {len(failed_ids) - 10} 个"
+                    result_msg += "\n"
+                result_msg += f"\n📋 文案: {ad_text[:50]}{'...' if len(ad_text) > 50 else ''}"
+                send_message("private", from_user_id, result_msg)
             elif from_user_id:
                 send_message("private", from_user_id, "🐕 警告：这是内部管理指令，你没有权限使用哦！")
             return jsonify({"status": "ok"}), 200
