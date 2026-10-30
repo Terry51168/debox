@@ -2,6 +2,7 @@ import os
 import re
 import time
 import hmac
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -16,45 +17,87 @@ WEBHOOK_KEY = os.getenv("DEBOX_WEBHOOK_KEY", "")
 # 数据后台配置
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+UPSTASH_HEADERS = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
 
 # ⚠️ 你的专属管理员 ID（请确认是 Webhook 推送的真实 from_user_id，而不是邀请链接 code）
 ADMIN_USER_ID = "9410sfdk"
 
-# ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer，24h 刷新） =====
-PHISHING_LIST_TTL = 3600  # 每小时刷新一次（新钓鱼站最坏 1h 内被覆盖；数据量小，成本可忽略）
+# ===== 共享线程池（模块级复用，避免每个请求现建现弃） =====
+_QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="query")
+_STATS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stats")
+
+
+# ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer） =====
+PHISHING_LIST_TTL = 3600  # 每小时刷新一次；后台线程定时更新，不阻塞请求线程
+METAMASK_BLACKLIST_URL = "https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/main/src/data.json"
+SCAMSNIFFER_BLACKLIST_URL = "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains/list.txt"
+
 _phishing_list_cache = {"domains": set(), "ts": 0.0, "loaded": False}
+_phishing_lock = threading.Lock()   # 保护缓存读写
+_refresh_lock = threading.Lock()    # 保证同时只有一个线程在下载
+
 
 def _fetch_lines(url):
     try:
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, timeout=15)
+        res.raise_for_status()
         return res.text.splitlines()
     except Exception:
         return []
 
-def get_phishing_blocklist():
-    """合并 MetaMask eth-phishing-detect 与 ScamSniffer 开源黑名单。
-    拉取失败时保留旧缓存，绝不因数据源故障而漏报已确认的钓鱼站。"""
-    now = time.time()
-    if _phishing_list_cache["loaded"] and now - _phishing_list_cache["ts"] < PHISHING_LIST_TTL:
-        return _phishing_list_cache["domains"]
+
+def _load_phishing_blocklist():
+    """拉取并合并 MetaMask 与 ScamSniffer 黑名单（网络操作，只在刷新线程里做）。"""
     domains = set()
-    # MetaMask 官方钓鱼域名库（19.8万+）
     try:
-        res = requests.get("https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/main/src/data.json", timeout=8)
-        import json as _json
+        res = requests.get(METAMASK_BLACKLIST_URL, timeout=15)
+        res.raise_for_status()
         data = res.json()
         domains.update(d.lower() for d in (data.get("blacklist") or []))
-    except Exception:
-        pass
-    # ScamSniffer 开源黑名单（25万+，分钟级更新）
-    for line in _fetch_lines("https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains/list.txt"):
+    except Exception as e:
+        print(f"[phishing] MetaMask 黑名单拉取失败: {e}")
+    for line in _fetch_lines(SCAMSNIFFER_BLACKLIST_URL):
         line = line.strip().lower()
         if line and not line.startswith("#"):
             domains.add(line)
-    if domains:  # 只有拉到了新数据才更新缓存
-        _phishing_list_cache.update({"domains": domains, "ts": now, "loaded": True})
-        print(f"[phishing] 黑名单已加载 {len(domains)} 个域名")
-    return _phishing_list_cache["domains"]
+    return domains
+
+
+def _refresh_phishing_blocklist(force=False):
+    """加载/刷新黑名单。失败时保留旧缓存，绝不因数据源故障而漏报已确认的钓鱼站。"""
+    now = time.time()
+    with _phishing_lock:
+        if not force and _phishing_list_cache["loaded"] and now - _phishing_list_cache["ts"] < PHISHING_LIST_TTL:
+            return _phishing_list_cache["domains"]
+    if not _refresh_lock.acquire(blocking=False):
+        # 已有线程在刷新，直接返回现有缓存（可能为空/稍旧，但绝不阻塞请求线程）
+        with _phishing_lock:
+            return _phishing_list_cache["domains"]
+    try:
+        domains = _load_phishing_blocklist()
+        if domains:  # 只有拉到了新数据才更新缓存
+            with _phishing_lock:
+                _phishing_list_cache.update({"domains": domains, "ts": time.time(), "loaded": True})
+            print(f"[phishing] 黑名单已加载 {len(domains)} 个域名")
+    finally:
+        _refresh_lock.release()
+    with _phishing_lock:
+        return _phishing_list_cache["domains"]
+
+
+def get_phishing_blocklist():
+    return _refresh_phishing_blocklist(force=False)
+
+
+def _phishing_refresh_loop():
+    """后台定时刷新，把 45 万+ 行黑名单的下载放到后台线程，避免卡住请求。"""
+    while True:
+        time.sleep(PHISHING_LIST_TTL)
+        try:
+            _refresh_phishing_blocklist(force=True)
+        except Exception as e:
+            print(f"[phishing] 后台刷新异常: {e}")
+
 
 def check_domain_in_blocklist(domain):
     """精确匹配 + 子域匹配（如 evil.uniswap.com 命中 uniswap.com 的变体子域）。"""
@@ -69,6 +112,7 @@ def check_domain_in_blocklist(domain):
             return True
     return False
 
+
 # ===== 仿冒域名识别（typosquatting） =====
 # 主流合法站点清单：骗子常注册与这些站点高度相似的域名
 TRUSTED_BRAND_DOMAINS = [
@@ -77,8 +121,9 @@ TRUSTED_BRAND_DOMAINS = [
     "jup.ag", "orca.so", "metamask.io", "trustwallet.com",
     "binance.com", "okx.com", "bybit.com", "gate.io",
     "coinbase.com", "kucoin.com", "bitget.com", "htx.com",
-    "etherenum.org", "ethereum.org", "solana.com", "debox.pro",
+    "ethereum.org", "solana.com", "debox.pro",
 ]
+
 
 def _levenshtein(a, b):
     """编辑距离（纯 Python 实现，域名短字符串足够快）。"""
@@ -92,6 +137,7 @@ def _levenshtein(a, b):
         prev = cur
     return prev[-1]
 
+
 # 骗子仿冒域名常用拼接词
 IMPERSONATION_TOKENS = {
     "app", "io", "official", "login", "exchange", "earn", "verify",
@@ -99,6 +145,7 @@ IMPERSONATION_TOKENS = {
     "secure", "support", "team", "site", "online", "vip", "claim",
     "stake", "launch", "web", "download", "help", "service",
 }
+
 
 def check_domain_lookalike(domain):
     """识别与主流站点高度相似的仿冒域名。
@@ -126,6 +173,7 @@ def check_domain_lookalike(domain):
             return brand
     return None
 
+
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
@@ -147,9 +195,31 @@ CHAIN_NAMES = {
 # Base58 字符集（用于 Solana 地址严格校验）
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
+
 # ===== 简易查询缓存：同 CA 60 秒内不重复打 API =====
 _QUERY_CACHE = {}
+_QUERY_CACHE_LOCK = threading.Lock()
 QUERY_CACHE_TTL = 60
+_QUERY_CACHE_MAX = 10000
+
+
+def _query_cache_is_fresh(addr):
+    with _QUERY_CACHE_LOCK:
+        ts = _QUERY_CACHE.get(addr)
+        return ts is not None and (time.time() - ts) < QUERY_CACHE_TTL
+
+
+def _query_cache_set(addr):
+    """写入查询时间戳；带过期清理与上限保护，防止长期运行内存无限增长。"""
+    now = time.time()
+    with _QUERY_CACHE_LOCK:
+        if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+            expired = [k for k, ts in _QUERY_CACHE.items() if now - ts >= QUERY_CACHE_TTL]
+            for k in expired:
+                del _QUERY_CACHE[k]
+            if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+                _QUERY_CACHE.clear()
+        _QUERY_CACHE[addr] = now
 
 
 def is_valid_solana_address(addr):
@@ -195,49 +265,66 @@ def to_float(v, default=0.0):
         return default
 
 
-def fmt_flag(name, value, safe_when="0"):
-    """审计开关：✅=安全，❌=危险，➖=数据缺失。value 为 "0"/"1"。"""
-    if value is None or str(value) == "":
-        return f"{name}➖"
-    ok = (str(value) == safe_when)
-    return f"{name}{'✅' if ok else '❌'}"
-
-
 # ================= 运营数据统计系统 =================
-def record_realtime_group(group_id):
-    if not UPSTASH_URL or not UPSTASH_TOKEN or not group_id: return
+def _fire_and_forget(fn, *args, **kwargs):
+    """把慢速的外部统计写入丢到后台线程，避免拖慢 Webhook 响应。"""
     try:
-        requests.get(f"{UPSTASH_URL}/sadd/all_groups/{group_id}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3)
+        _STATS_EXECUTOR.submit(fn, *args, **kwargs)
+    except Exception as e:
+        print(f"[stats] 后台任务提交失败: {e}")
+
+
+def _do_record_realtime_group(group_id):
+    try:
+        requests.get(f"{UPSTASH_URL}/sadd/all_groups/{group_id}", headers=UPSTASH_HEADERS, timeout=3)
     except Exception as e:
         print(f"[stats] record_realtime_group 异常: {e}")
 
 
-def record_user_activity(user_id):
-    if not UPSTASH_URL or not UPSTASH_TOKEN or not user_id: return
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+def record_realtime_group(group_id):
+    if not UPSTASH_URL or not UPSTASH_TOKEN or not group_id: return
+    _fire_and_forget(_do_record_realtime_group, group_id)
+
+
+def _do_record_user_activity(user_id):
     now = get_beijing_time()
     today_str = now.strftime("%Y%m%d")
     start_of_week = now - timedelta(days=now.weekday())
     week_str = start_of_week.strftime("%Y%m%d")
     month_str = now.strftime("%Y%m")
     try:
-        requests.get(f"{UPSTASH_URL}/sadd/all_users/{user_id}", headers=headers, timeout=3)
-        requests.get(f"{UPSTASH_URL}/incr/total_queries", headers=headers, timeout=3)
-        requests.get(f"{UPSTASH_URL}/sadd/active_daily_{today_str}/{user_id}", headers=headers, timeout=3)
-        requests.get(f"{UPSTASH_URL}/sadd/active_weekly_{week_str}/{user_id}", headers=headers, timeout=3)
-        requests.get(f"{UPSTASH_URL}/sadd/active_monthly_{month_str}/{user_id}", headers=headers, timeout=3)
+        requests.get(f"{UPSTASH_URL}/sadd/all_users/{user_id}", headers=UPSTASH_HEADERS, timeout=3)
+        requests.get(f"{UPSTASH_URL}/incr/total_queries", headers=UPSTASH_HEADERS, timeout=3)
+        requests.get(f"{UPSTASH_URL}/sadd/active_daily_{today_str}/{user_id}", headers=UPSTASH_HEADERS, timeout=3)
+        requests.get(f"{UPSTASH_URL}/sadd/active_weekly_{week_str}/{user_id}", headers=UPSTASH_HEADERS, timeout=3)
+        requests.get(f"{UPSTASH_URL}/sadd/active_monthly_{month_str}/{user_id}", headers=UPSTASH_HEADERS, timeout=3)
     except Exception as e:
         print(f"[stats] record_user_activity 异常: {e}")
+
+
+def record_user_activity(user_id):
+    if not UPSTASH_URL or not UPSTASH_TOKEN or not user_id: return
+    _fire_and_forget(_do_record_user_activity, user_id)
 
 
 def get_cardinality(key):
     if not UPSTASH_URL: return 0
     try:
-        res = requests.get(f"{UPSTASH_URL}/scard/{key}", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3).json()
+        res = requests.get(f"{UPSTASH_URL}/scard/{key}", headers=UPSTASH_HEADERS, timeout=3).json()
         return res.get("result", 0)
     except Exception as e:
         print(f"[stats] get_cardinality({key}) 异常: {e}")
         return 0
+
+
+def _upstash_get_value(key):
+    if not UPSTASH_URL: return None
+    try:
+        res = requests.get(f"{UPSTASH_URL}/get/{key}", headers=UPSTASH_HEADERS, timeout=3).json()
+        return res.get("result")
+    except Exception as e:
+        print(f"[stats] get({key}) 异常: {e}")
+        return None
 
 
 def calc_growth(current, previous):
@@ -256,22 +343,33 @@ def get_usage_stats():
     this_month = now.strftime("%Y%m")
     last_month = (now.replace(day=1) - timedelta(days=1)).strftime("%Y%m")
 
-    stats = {}
-    stats["total_groups"] = get_cardinality("all_groups")
-    stats["total_users"] = get_cardinality("all_users")
-    try:
-        res_q = requests.get(f"{UPSTASH_URL}/get/total_queries", headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"}, timeout=3).json()
-        stats["total_queries"] = int(res_q.get("result") or 0)
-    except Exception as e:
-        print(f"[stats] total_queries 异常: {e}")
-        stats["total_queries"] = 0
+    # 并发拉取所有基数指标 + 累计查询数，把串行 8 次请求压到 1 轮
+    keys = {
+        "total_groups": "all_groups",
+        "total_users": "all_users",
+        "today": f"active_daily_{today}",
+        "yesterday": f"active_daily_{yesterday}",
+        "this_week": f"active_weekly_{this_week}",
+        "last_week": f"active_weekly_{last_week}",
+        "this_month": f"active_monthly_{this_month}",
+        "last_month": f"active_monthly_{last_month}",
+    }
+    futures = {name: _STATS_EXECUTOR.submit(get_cardinality, key) for name, key in keys.items()}
+    q_future = _STATS_EXECUTOR.submit(_upstash_get_value, "total_queries")
+    card = {name: f.result() for name, f in futures.items()}
 
-    today_active = get_cardinality(f"active_daily_{today}")
-    yesterday_active = get_cardinality(f"active_daily_{yesterday}")
-    this_week_active = get_cardinality(f"active_weekly_{this_week}")
-    last_week_active = get_cardinality(f"active_weekly_{last_week}")
-    this_month_active = get_cardinality(f"active_monthly_{this_month}")
-    last_month_active = get_cardinality(f"active_monthly_{last_month}")
+    stats = {
+        "total_groups": card["total_groups"],
+        "total_users": card["total_users"],
+        "total_queries": int(q_future.result() or 0),
+    }
+
+    today_active = card["today"]
+    yesterday_active = card["yesterday"]
+    this_week_active = card["this_week"]
+    last_week_active = card["last_week"]
+    this_month_active = card["this_month"]
+    last_month_active = card["last_month"]
 
     stats["daily_str"] = f"{today_active} 人 (较昨日 {calc_growth(today_active, yesterday_active)})"
     stats["weekly_str"] = f"{this_week_active} 人 (较上周 {calc_growth(this_week_active, last_week_active)})"
@@ -284,16 +382,39 @@ def goplus_evm(chain_id, ca_address):
     """查询 GoPlus EVM 安全数据，失败返回 {}"""
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca_address}"
     try:
-        res = requests.get(url, timeout=5).json()
-        if res.get("code") == 1 and res.get("result"):
-            return res["result"].get(ca_address.lower(), {}) or {}
+        res = requests.get(url, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        if data.get("code") == 1 and data.get("result"):
+            return data["result"].get(ca_address.lower(), {}) or {}
     except Exception as e:
         print(f"[query] GoPlus EVM 异常: {e}")
     return {}
 
 
-# 地址分类缓存：合约/EOA 判定结果复用，避免重复打 API
+# 地址分类缓存：合约/EOA 判定结果复用，避免重复打 API（加锁，供线程池并发安全读写）
 _ADDR_CACHE = {}
+_ADDR_CACHE_LOCK = threading.Lock()
+_ADDR_CACHE_MAX = 20000
+
+
+def _addr_cache_get(addr):
+    with _ADDR_CACHE_LOCK:
+        return _ADDR_CACHE.get(addr)
+
+
+def _addr_cache_set(addr, value):
+    with _ADDR_CACHE_LOCK:
+        if len(_ADDR_CACHE) >= _ADDR_CACHE_MAX:
+            _ADDR_CACHE.clear()
+        _ADDR_CACHE[addr] = value
+
+
+def _addr_cache_merge(addr, **updates):
+    with _ADDR_CACHE_LOCK:
+        merged = {**(_ADDR_CACHE.get(addr, {})), **updates}
+        _ADDR_CACHE[addr] = merged
+        return merged
 
 
 # 公共 RPC 端点（用于 eth_getCode 验证地址是否为合约，GoPlus 无索引时的兜底）
@@ -306,32 +427,38 @@ RPC_ENDPOINTS = {
     "10":   ["https://optimism-rpc.publicnode.com"],
 }
 
+
 def is_contract_via_rpc(addr, chain_id):
-    """链上终极验证：eth_getCode 有代码 = 合约。数据来自节点，不依赖任何索引商。"""
+    """链上终极验证：eth_getCode 有代码 = 合约。数据来自节点，不依赖任何索引商。
+    节点返回 JSON-RPC 错误/限流时继续尝试下一个节点，避免误判为 EOA。"""
     for rpc in RPC_ENDPOINTS.get(str(chain_id), []):
         try:
             res = requests.post(rpc, json={
                 "jsonrpc": "2.0", "id": 1, "method": "eth_getCode",
                 "params": [addr, "latest"]
             }, timeout=5).json()
-            code = (res.get("result") or "0x")
-            return code != "0x"  # 有代码 → 合约
+            if res.get("error") is not None or res.get("result") is None:
+                continue  # 节点异常/限流 → 换下一个
+            return res["result"] != "0x"  # 有代码 → 合约
         except Exception:
             continue
     return None  # 所有节点都失败 → 无法判定
+
 
 def classify_holder(addr, chain_id):
     """判断持仓地址是否为合约地址（交易所/质押池/金库等通常是合约或平台地址）"""
     addr = (addr or "").lower()
     if not addr.startswith("0x"):
         return {"is_contract": False}
-    if addr in _ADDR_CACHE:
-        return _ADDR_CACHE[addr]
+    cached = _addr_cache_get(addr)
+    if cached is not None:
+        return cached
     try:
         res = requests.get(
             f"https://api.gopluslabs.io/api/v1/address_security/{addr}?chain_id={chain_id}",
-            timeout=5).json()
-        info = res.get("result", {}) or {}
+            timeout=5)
+        res.raise_for_status()
+        info = res.json().get("result", {}) or {}
         # 实测字段名为 contract_address（"1"=合约）；兼容 is_contract 命名
         is_contract = info.get("contract_address") == "1" or info.get("is_contract") == "1"
         # 关键补刀：GoPlus 无索引数据时（data_source 为空），"0"只是默认值不可信，
@@ -344,7 +471,7 @@ def classify_holder(addr, chain_id):
     except Exception as e:
         print(f"[query] address_security 异常: {e}")
         out = {"is_contract": False}  # 查不到时按个人地址处理，不放大风险
-    _ADDR_CACHE[addr] = out
+    _addr_cache_set(addr, out)
     return out
 
 
@@ -389,8 +516,11 @@ KNOWN_PEGGED = {
     },
 }
 
-# 兼容旧引用
-KNOWN_PEGGED_BSC = KNOWN_PEGGED.get("56", set())
+# 黑洞/死地址：LP 销毁是最安全的状态，不算个人集中
+BURN_ADDRESSES = {
+    "0x0000000000000000000000000000000000000000",
+    "0x000000000000000000000000000000000000dead",
+}
 
 
 def build_evm_lines(info, chain_id=None, ca_address=None):
@@ -400,15 +530,13 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     sell_tax = to_float(info.get("sell_tax")) * 100
     holders = [(h.get("address", "") or "", to_float(h.get("percent")) * 100)
                for h in (info.get("holders") or [])[:10]
-               if (h.get("address", "") or "").lower() not in
-               ["0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"]]
+               if (h.get("address", "") or "").lower() not in BURN_ADDRESSES]
     top10_pct = sum(pct for _, pct in holders)
 
     # 细化：前10里拆出合约地址（质押池/金库/交易所等）与个人地址（并行查询不拖慢回复）
     contract_pct = 0.0
     if holders and chain_id:
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            results = list(ex.map(lambda ap: classify_holder(ap[0], chain_id), holders))
+        results = list(_QUERY_EXECUTOR.map(lambda ap: classify_holder(ap[0], chain_id), holders))
         contract_pct = sum(pct for (addr, pct), r in zip(holders, results) if r["is_contract"])
         eoa_pct = top10_pct - contract_pct
     else:
@@ -436,11 +564,8 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     # 合约地址（交易所/金库/锁仓合约，如币安钱包）→ 正常，不报警
     lp_personal_warn = False
     if lp_holders and lp_locked_pct is None and chain_id:
-        # 排除黑洞/零地址：LP 销毁是最安全的状态，不算个人集中
-        burn_addrs = {"0x0000000000000000000000000000000000000000",
-                      "0x000000000000000000000000000000000000dead"}
         real_lp = [h for h in lp_holders
-                   if (h.get("address", "") or "").lower() not in burn_addrs]
+                   if (h.get("address", "") or "").lower() not in BURN_ADDRESSES]
         if real_lp:
             top_lp = max(real_lp, key=lambda h: to_float(h.get("percent")))
             top_lp_pct = to_float(top_lp.get("percent")) * 100
@@ -490,7 +615,7 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
         ra = (role_addr or "").lower()
         if not ra.startswith("0x"):
             continue
-        cached = _ADDR_CACHE.get(ra) or {}
+        cached = _addr_cache_get(ra) or {}
         if "flags" in cached:
             bad_flags = cached["flags"]
         else:
@@ -498,14 +623,15 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
             try:
                 res = requests.get(
                     f"https://api.gopluslabs.io/api/v1/address_security/{ra}?chain_id={chain_id}",
-                    timeout=5).json()
-                rinfo = res.get("result", {}) or {}
+                    timeout=5)
+                res.raise_for_status()
+                rinfo = res.json().get("result", {}) or {}
                 if rinfo.get("data_source"):  # 有真实索引数据才采信，默认值不算数
                     bad_flags = [f for f in MALICIOUS_FLAGS if str(rinfo.get(f)) == "1"]
             except Exception:
                 bad_flags = []
-            _ADDR_CACHE[ra] = {**cached, "is_contract": cached.get("is_contract", False),
-                               "flags": bad_flags}
+            _addr_cache_merge(ra, is_contract=cached.get("is_contract", False),
+                              flags=bad_flags)
         if bad_flags:
             suspicious_roles.append(f"{role}涉黑")
     if suspicious_roles:
@@ -618,8 +744,9 @@ def get_token_full_info(ca_address):
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     pairs = []
     try:
-        res = requests.get(dex_url, timeout=5).json()
-        pairs = res.get("pairs", []) or []
+        res = requests.get(dex_url, timeout=5)
+        res.raise_for_status()
+        pairs = res.json().get("pairs", []) or []
     except Exception as e:
         print(f"[query] DexScreener 异常: {e}")
 
@@ -678,8 +805,9 @@ def _get_solana_token_info(ca_address):
     dex_url = f"https://api.dexscreener.com/latest/dex/tokens/{ca_address}"
     pairs = []
     try:
-        res = requests.get(dex_url, timeout=5).json()
-        pairs = res.get("pairs", []) or []
+        res = requests.get(dex_url, timeout=5)
+        res.raise_for_status()
+        pairs = res.json().get("pairs", []) or []
     except Exception as e:
         print(f"[query] DexScreener SOL 异常: {e}")
 
@@ -709,9 +837,11 @@ def _get_solana_token_info(ca_address):
     fatal_items, warn_items, unknown_items = [], [], []
     goplus_url = f"https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses={ca_address}"
     try:
-        g_res = requests.get(goplus_url, timeout=5).json()
-        if g_res.get("code") == 1 and g_res.get("result"):
-            info = g_res["result"].get(ca_address, {}) or {}
+        res = requests.get(goplus_url, timeout=5)
+        res.raise_for_status()
+        g_data = res.json()
+        if g_data.get("code") == 1 and g_data.get("result"):
+            info = g_data["result"].get(ca_address, {}) or {}
             if info:
                 mint_status = (info.get("mintable") or {}).get("status", "")
                 freeze_status = (info.get("freezable") or {}).get("status", "")
@@ -741,7 +871,9 @@ def send_message(chat_type, chat_id, content, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(url, json=payload, headers=headers, timeout=10)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
+        if res.status_code != 200:
+            print(f"[send] 发送失败 status={res.status_code} body={res.text[:200]}")
     except Exception as e:
         print(f"==== 发送消息异常: {e} ====")
 
@@ -759,7 +891,9 @@ def extract_valid_ca(message):
 # ================= Webhook 路由 =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    if not hmac.compare_digest(request.headers.get("X-API-KEY", ""), WEBHOOK_KEY):
+    header_key = request.headers.get("X-API-KEY", "")
+    # 鉴权 fail-closed：环境变量未配置时直接拒绝，避免误放行
+    if not WEBHOOK_KEY or not hmac.compare_digest(header_key, WEBHOOK_KEY):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
@@ -833,8 +967,10 @@ def webhook():
                     else:
                         # 第3层：GoPlus 实时接口兜底
                         try:
-                            resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3).json()
-                            result = resp.get("result") or {}
+                            resp = requests.get(f"https://api.gopluslabs.io/api/v1/phishing_site?url={url}", timeout=3)
+                            resp.raise_for_status()
+                            g_data = resp.json()
+                            result = g_data.get("result") or {}
                             phishing_flag = None
                             if isinstance(result, dict):
                                 if result.get("phishing_site") is not None:
@@ -844,7 +980,7 @@ def webhook():
                                         if isinstance(v, dict) and v.get("phishing_site") is not None:
                                             phishing_flag = str(v.get("phishing_site"))
                                             break
-                            if resp.get("code") == 1 and phishing_flag == "1":
+                            if g_data.get("code") == 1 and phishing_flag == "1":
                                 source = "GoPlus 安全库"
                         except Exception:
                             pass  # GoPlus 超时不报警（宁可漏一条也不误报）
@@ -855,17 +991,14 @@ def webhook():
                         f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！"
                     )
                     send_message("group", group_id, reply_text)
-                # 未命中任何黑名单 → 静默放行，不再刷"未在白名单内"
-                return jsonify({"status": "ok"}), 200
+                # 未命中任何黑名单 → 静默放行；继续往下走，不拦截同一消息里的合约地址
 
         # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
         ca_address = extract_valid_ca(message)
         if ca_address:
-            now_ts = time.time()
-            cached = _QUERY_CACHE.get(ca_address)
-            if cached and now_ts - cached < QUERY_CACHE_TTL:
+            if _query_cache_is_fresh(ca_address):
                 return jsonify({"status": "ok", "cached": True}), 200
-            _QUERY_CACHE[ca_address] = now_ts
+            _query_cache_set(ca_address)
 
             try:
                 reply_text, markup = get_token_full_info(ca_address)
@@ -878,5 +1011,13 @@ def webhook():
 
     return jsonify({"status": "ok"}), 200
 
+
+def start_background_tasks():
+    """启动后台线程（黑名单预热 + 定时刷新）。daemon 线程随进程退出自动回收。"""
+    threading.Thread(target=_refresh_phishing_blocklist, kwargs={"force": True}, daemon=True).start()
+    threading.Thread(target=_phishing_refresh_loop, daemon=True).start()
+
+
+start_background_tasks()
 
 handler = app
