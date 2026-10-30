@@ -114,6 +114,10 @@ RPC_ENDPOINTS = {
     "42161": ["https://arbitrum-one-rpc.publicnode.com"],
     "8453":  ["https://base-rpc.publicnode.com"],
     "10":    ["https://optimism-rpc.publicnode.com"],
+    # AVAX 在 CHAIN_MAPPING 里但长期缺这张表 → 该链所有币的持币地址
+    # 都拿不到 eth_getCode 兜底，合约池子会被当成个人钱包（误报"死控盘"）
+    "43114": ["https://avalanche-c-chain-rpc.publicnode.com",
+              "https://api.avax.network/ext/bc/C/rpc"],
 }
 
 # Base58 字符集（用于 Solana 地址严格校验）
@@ -1173,17 +1177,28 @@ def _send(data, content, reply_markup=None):
         send_message("private", data["from_user_id"], content, reply_markup)
 
 
-def _domain_of(message):
-    """提取待检测域名：优先带协议链接，其次裸域名。"""
-    match_url = URL_PATTERN.search(message)
-    if match_url:
-        # 用 hostname 而非 netloc：自动剥离 :端口 与 user:pw@，否则带端口的钓鱼域名会绕过本地黑名单
-        parsed = urlparse(match_url.group())
-        return (parsed.hostname or "").lower().strip(".")
-    m_dom = DOMAIN_PATTERN.search(message)
-    if m_dom:
-        return m_dom.group(1).lower()
-    return None
+MAX_DOMAINS_PER_MESSAGE = 5   # 一条消息最多检几个域名：防止有人塞 50 个链接刷爆接口
+
+
+def _domains_of(message):
+    """提取消息里所有待检测域名（去重、保持出现顺序）。
+
+    原实现只取第一个链接：先放一个正常链接、再放钓鱼链接即可稳定绕过。
+    链接取 hostname（自动剥离 :端口 与 user:pw@），裸域名单独再扫一遍，
+    两者天然不重复 —— DOMAIN_PATTERN 的负向后顾排除了紧跟在 "/" 后的域名。
+    """
+    seen, out = set(), []
+    for m in URL_PATTERN.finditer(message):
+        host = (urlparse(m.group()).hostname or "").lower().strip(".")
+        if host and host not in seen:
+            seen.add(host)
+            out.append(host)
+    for m in DOMAIN_PATTERN.finditer(message):
+        dom = m.group(1).lower()
+        if dom not in seen:
+            seen.add(dom)
+            out.append(dom)
+    return out[:MAX_DOMAINS_PER_MESSAGE]
 
 
 def check_phishing(domain):
@@ -1249,17 +1264,29 @@ def handle_message(data):
 
     # 3. 精准防钓鱼检测（仅群聊触发；静默模式：只有确认钓鱼才报警）
     # 支持：带协议链接（https://xxx）和裸域名（metamask-io.app）
-    domain = _domain_of(message)
-    if domain and group_id:
+    # 一条消息里的**每个**域名都要查：只查第一个的话，前面放个正常链接就能绕过。
+    domains = _domains_of(message)
+    if domains and group_id:
         allowed = ALLOWED_DOMAINS
-        if not any(domain == d or domain.endswith("." + d) for d in allowed):
+        hits = []
+        for domain in domains:
+            if any(domain == d or domain.endswith("." + d) for d in allowed):
+                continue
             source = check_phishing(domain)
             if source:
-                send_message(
-                    "group", group_id,
-                    f"🚨 高危警告：{source}检测到该链接为钓鱼网站！\n"
-                    f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！")
-            # 未命中任何黑名单 → 静默放行；继续往下走，不拦截同一消息里的合约地址
+                hits.append((domain, source))
+        if hits:
+            # 命中多个时合并成一条：逐个报警会刷屏，反而让人屏蔽机器人
+            if len(hits) == 1:
+                domain, source = hits[0]
+                text = (f"🚨 高危警告：{source}检测到该链接为钓鱼网站！\n"
+                        f"🌐 域名: {domain}\n请勿点击，谨防钱包被盗！")
+            else:
+                rows = "\n".join(f"🎯 {d} —— {s}" for d, s in hits)
+                text = (f"🚨 高危警告：检测到 {len(hits)} 个钓鱼链接！\n"
+                        f"{rows}\n请勿点击，谨防钱包被盗！")
+            send_message("group", group_id, text)
+        # 未命中任何黑名单 → 静默放行；继续往下走，不拦截同一消息里的合约地址
 
     # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
     ca_address = extract_valid_ca(message)
