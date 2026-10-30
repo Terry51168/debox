@@ -40,38 +40,34 @@ _STATS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stats")
 
 
 # ===== 防钓鱼：多源黑名单（MetaMask + ScamSniffer） =====
-PHISHING_LIST_TTL = 3600  # 每小时刷新一次；后台线程定时更新，不阻塞请求线程
-METAMASK_BLACKLIST_URL = "https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/main/src/data.json"
-SCAMSNIFFER_BLACKLIST_URL = "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains/list.txt"
+PHISHING_LIST_TTL = 3600  # 缓存有效期 1 小时；刷新由外部定时器调 /refresh-blocklist 触发
+METAMASK_BLACKLIST_URL = "https://raw.githubusercontent.com/MetaMask/eth-phishing-detect/main/src/config.json"
+SCAMSNIFFER_BLACKLIST_URL = "https://raw.githubusercontent.com/scamsniffer/scam-database/main/blacklist/domains.json"
 
 _phishing_list_cache = {"domains": set(), "ts": 0.0, "loaded": False}
 _phishing_lock = threading.Lock()   # 保护缓存读写
 _refresh_lock = threading.Lock()    # 保证同时只有一个线程在下载
 
 
-def _fetch_lines(url):
-    try:
-        res = _HTTP_SESSION.get(url, timeout=15)
-        res.raise_for_status()
-        return res.text.splitlines()
-    except Exception:
-        return []
-
-
 def _load_phishing_blocklist():
-    """拉取并合并 MetaMask 与 ScamSniffer 黑名单（网络操作，只在刷新线程里做）。"""
+    """拉取并合并 MetaMask 与 ScamSniffer 黑名单（网络操作，只在刷新线程里做）。
+    两个源均为 JSON：MetaMask 取 blacklist 字段，ScamSniffer 直接是域名数组。"""
     domains = set()
     try:
-        res = _HTTP_SESSION.get(METAMASK_BLACKLIST_URL, timeout=15)
+        res = _HTTP_SESSION.get(METAMASK_BLACKLIST_URL, timeout=25)
         res.raise_for_status()
         data = res.json()
-        domains.update(d.lower() for d in (data.get("blacklist") or []))
+        domains.update(str(d).strip().lower().strip(".") for d in (data.get("blacklist") or []))
     except Exception as e:
         print(f"[phishing] MetaMask 黑名单拉取失败: {e}")
-    for line in _fetch_lines(SCAMSNIFFER_BLACKLIST_URL):
-        line = line.strip().lower()
-        if line and not line.startswith("#"):
-            domains.add(line)
+    try:
+        res = _HTTP_SESSION.get(SCAMSNIFFER_BLACKLIST_URL, timeout=25)
+        res.raise_for_status()
+        data = res.json()
+        if isinstance(data, list):
+            domains.update(str(d).strip().lower().strip(".") for d in data)
+    except Exception as e:
+        print(f"[phishing] ScamSniffer 黑名单拉取失败: {e}")
     return domains
 
 
@@ -185,6 +181,9 @@ URL_PATTERN = re.compile(r"https?://[^\s]+")
 # 只匹配 .常见TLD 结尾、至少两段的域名，避免把普通英文句子误判
 DOMAIN_PATTERN = re.compile(r"(?<![\w@.\/])((?:[a-zA-Z0-9][a-zA-Z0-9-]*\.)+(?:com|net|org|io|app|xyz|vip|top|cc|me|pro|finance|site|online|info|biz|link|club|fun|ltd|shop|store|tech|zone|page|dev|one|pw|tv|co|ai|cn|us|uk|jp|kr|de|fr|hk|tw|mo|asia|mobi|gov|edu|id|my|sg|in|au))\b")
 
+# 帮助指令：必须"整条消息"就是其中之一才触发教程，避免日常词（说明/菜单）误触发
+HELP_COMMANDS = {"/help", "/帮助", "/menu", "帮助", "使用说明", "菜单", "教程"}
+
 CHAIN_MAPPING = {
     "ethereum": "1", "bsc": "56", "polygon": "137",
     "arbitrum": "42161", "base": "8453", "avalanche": "43114",
@@ -207,23 +206,31 @@ QUERY_CACHE_TTL = 60
 _QUERY_CACHE_MAX = 10000
 
 
-def _query_cache_is_fresh(addr):
+def _query_cache_get(addr):
+    """返回 60 秒内缓存的查询结果 (reply_text, markup)；未命中/已过期返回 None。
+    缓存的是结果本身而非时间戳，这样命中时可以把同一条报告回复给任意群/用户。"""
     with _QUERY_CACHE_LOCK:
-        ts = _QUERY_CACHE.get(addr)
-        return ts is not None and (time.time() - ts) < QUERY_CACHE_TTL
+        item = _QUERY_CACHE.get(addr)
+        if not item:
+            return None
+        ts, reply_text, markup = item
+        if time.time() - ts >= QUERY_CACHE_TTL:
+            _QUERY_CACHE.pop(addr, None)
+            return None
+        return reply_text, markup
 
 
-def _query_cache_set(addr):
-    """写入查询时间戳；带过期清理与上限保护，防止长期运行内存无限增长。"""
+def _query_cache_set(addr, reply_text, markup=None):
+    """查询成功后才写入结果；带过期清理与上限保护，防止长期运行内存无限增长。"""
     now = time.time()
     with _QUERY_CACHE_LOCK:
         if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
-            expired = [k for k, ts in _QUERY_CACHE.items() if now - ts >= QUERY_CACHE_TTL]
+            expired = [k for k, v in _QUERY_CACHE.items() if now - v[0] >= QUERY_CACHE_TTL]
             for k in expired:
                 del _QUERY_CACHE[k]
             if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
                 _QUERY_CACHE.clear()
-        _QUERY_CACHE[addr] = now
+        _QUERY_CACHE[addr] = (now, reply_text, markup)
 
 
 def is_valid_solana_address(addr):
@@ -949,8 +956,9 @@ def webhook():
         record_realtime_group(group_id)
 
     if message:
-        # 1. 使用教程
-        if any(k in message.lower() for k in ["/help", "教程", "菜单", "说明"]):
+        # 1. 使用教程（仅认"整条消息就是命令"，避免"说明""菜单"等日常词误触发，也避免钓鱼消息靠塞关键词绕过检测）
+        _cmd = re.sub(r"^(?:@[^\s]+\s*)+", "", message.strip()).strip().lower()
+        if _cmd in HELP_COMMANDS or _cmd.startswith("/help") or _cmd.startswith("/帮助"):
             help_text = (
                 "🐕‍🦺 链上警犬使用说明\n\n"
                 "👉 查代币安全：直接在群内发送合约地址（支持 EVM 0x 开头 及 Solana Base58 地址），警犬会立刻帮你排雷。\n"
@@ -989,7 +997,9 @@ def webhook():
         match_url = URL_PATTERN.search(message)
         _domain_target = None
         if match_url:
-            _domain_target = urlparse(match_url.group()).netloc.lower()
+            # 用 hostname 而非 netloc：自动剥离 :端口 与 user:pw@，否则带端口的钓鱼域名会绕过本地黑名单
+            _parsed_url = urlparse(match_url.group())
+            _domain_target = (_parsed_url.hostname or "").lower().strip(".")
         else:
             m_dom = DOMAIN_PATTERN.search(message)
             if m_dom:
@@ -1040,12 +1050,18 @@ def webhook():
         # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
         ca_address = extract_valid_ca(message)
         if ca_address:
-            if _query_cache_is_fresh(ca_address):
+            cached = _query_cache_get(ca_address)
+            if cached is not None:
+                # 命中缓存也要回复：否则别的群/用户 60 秒内查同一个币会收不到任何消息
+                reply_text, markup = cached
+                if group_id: send_message("group", group_id, reply_text, markup)
+                elif from_user_id: send_message("private", from_user_id, reply_text, markup)
+                record_user_activity(from_user_id)
                 return jsonify({"status": "ok", "cached": True}), 200
 
             try:
                 reply_text, markup = get_token_full_info(ca_address)
-                _query_cache_set(ca_address)  # 查询成功才写缓存，失败 60 秒内可重试
+                _query_cache_set(ca_address, reply_text, markup)  # 查询成功才写缓存，失败 60 秒内可重试
                 if group_id: send_message("group", group_id, reply_text, markup)
                 elif from_user_id: send_message("private", from_user_id, reply_text, markup)
                 record_user_activity(from_user_id)
