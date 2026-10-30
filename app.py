@@ -79,7 +79,14 @@ IMPERSONATION_TOKENS = {
 
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 # 0x 分支加负向前瞻 (?![a-fA-F0-9])：避免把 64 位裸交易 hash 的前 42 字符误当合约地址
-CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40}(?![a-fA-F0-9]))|([1-9A-HJ-NP-Za-km-z]{32,44})")
+# 两个分支都必须有"边界断言"，否则会从更长的串里截出一段：
+#   Solana 交易签名是 87~88 位 base58，无断言时会被截成前 44 位，
+#   而那 44 位解码后恰好是 32 字节 → 通过 is_valid_solana_address 校验
+#   → 把 tx 签名当代币地址去查，群里收到一条"数据不足"的假报告。
+CA_PATTERN = re.compile(
+    r"(0x[a-fA-F0-9]{40}(?![a-fA-F0-9]))"
+    r"|(?<![1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-km-z]{32,44})(?![1-9A-HJ-NP-Za-km-z])"
+)
 # re.I：HTTPS:// 这种大写协议头也要认。不认的话 "HTTPS://x.com" 不会被当成链接，
 # 裸域名规则又会从 "-" 后面截出错片段（binance-verify.vip → verify.vip），直接漏报。
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.I)
@@ -180,6 +187,20 @@ KNOWN_PEGGED = {
 QUERY_CACHE_TTL = 60      # 同 CA 60 秒内不重复打 API
 QUERY_CACHE_MAX = 10000
 ADDR_CACHE_MAX = 20000
+# 地址缓存必须有过期：合约/EOA 是事实，但"恶意标记"会更新；
+# 更重要的是判定逻辑升级后，长驻实例不该继续吃旧语义的缓存。
+ADDR_CACHE_TTL = 6 * 3600
+# 同一目标同一 CA 多久内只回一次：DeBox 超时重试通常发生在 10~60 秒后，
+# 期间结果已进缓存，不去重就会把同一份报告推两遍
+REPLY_DEDUP_TTL = 45
+
+# ===== 执行模式 =====
+# async：webhook 立即返回 200，查币丢线程池（长驻进程必须用这个，DeBox 侧超时会重试）
+# sync ：同步跑完整条查询链（Serverless 只能用这个：响应返回后实例即冻结，后台线程会被杀）
+# 未显式配置时按部署环境自动选择，见 SERVERLESS_ENV_MARKERS。
+QUERY_MODE = os.getenv("QUERY_MODE", "").strip().lower()
+SERVERLESS_ENV_MARKERS = ("VERCEL", "AWS_LAMBDA_FUNCTION_NAME",
+                          "FC_FUNCTION_NAME", "SCF_FUNCTIONNAME")
 
 # ===== 外链 =====
 EXPERIENCE_GROUP_URL = "https://m.debox.pro/group?id=sajshm5d&code=9410sfdk"
@@ -203,7 +224,17 @@ for _scheme in ("https://", "http://"):
                                        pool_connections=32, pool_maxsize=32))
 
 # ===== 共享线程池（模块级复用，避免每个请求现建现弃） =====
+# 三层池，职责严格分离，绝不能互相嵌套：
+#   QUERY_EXECUTOR —— 只跑"一次完整查询"（外层任务）
+#   SUB_EXECUTOR   —— 只跑查询内部的并行子调用（持仓分类 / 前科查询 / 多链探测）
+#   STATS_EXECUTOR —— 只跑统计上报，必须与查询隔离，不能拖慢也不能被拖住
+#
+# 为什么必须分成两个池：外层任务运行在 QUERY_EXECUTOR 的线程里，它内部要
+# `map()` 一批子任务并阻塞等结果。如果子任务提交回同一个池，而此刻池里
+# 16 个线程全被外层任务占满，子任务就永远排不到线程 —— 典型线程饥饿死锁，
+# 表现为这几个 CA 的查询永久挂起、Webhook 一直不回复，且不会自己恢复。
 QUERY_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="query")
+SUB_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="sub")
 STATS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stats")
 
 
@@ -227,7 +258,11 @@ def query_cache_get(addr):
 
 
 def query_cache_set(addr, reply_text, markup=None):
-    """查询成功后才写入结果；带过期清理与上限保护，防止长期运行内存无限增长。"""
+    """查询成功后才写入结果；带过期清理与上限保护，防止长期运行内存无限增长。
+
+    到上限时淘汰最旧的 20%，而不是清空：清空会让紧接着的一批请求全部穿透，
+    同一时刻打满上游接口（缓存雪崩）。
+    """
     now = time.time()
     with QUERY_CACHE_LOCK:
         if len(QUERY_CACHE) >= QUERY_CACHE_MAX:
@@ -236,7 +271,10 @@ def query_cache_set(addr, reply_text, markup=None):
             for k in expired:
                 del QUERY_CACHE[k]
             if len(QUERY_CACHE) >= QUERY_CACHE_MAX:
-                QUERY_CACHE.clear()
+                oldest = sorted(QUERY_CACHE.items(), key=lambda kv: kv[1][0])
+                drop = max(1, len(oldest) // 5)
+                for k, _v in oldest[:drop]:
+                    del QUERY_CACHE[k]
         QUERY_CACHE[addr] = (now, reply_text, markup)
 
 
@@ -257,22 +295,35 @@ def addr_cache_key(addr, chain_id):
 
 def addr_cache_get(addr, chain_id):
     with ADDR_CACHE_LOCK:
-        return ADDR_CACHE.get(addr_cache_key(addr, chain_id))
+        key = addr_cache_key(addr, chain_id)
+        item = ADDR_CACHE.get(key)
+        if item is None:
+            return None
+        if time.time() - item.get("_ts", 0) >= ADDR_CACHE_TTL:
+            ADDR_CACHE.pop(key, None)
+            return None
+        return {k: v for k, v in item.items() if k != "_ts"}
 
 
 def addr_cache_set(addr, value, chain_id):
     with ADDR_CACHE_LOCK:
         if len(ADDR_CACHE) >= ADDR_CACHE_MAX:
-            ADDR_CACHE.clear()
-        ADDR_CACHE[addr_cache_key(addr, chain_id)] = value
+            oldest = sorted(ADDR_CACHE.items(), key=lambda kv: kv[1].get("_ts", 0))
+            drop = max(1, len(oldest) // 5)
+            for k, _v in oldest[:drop]:
+                del ADDR_CACHE[k]
+        ADDR_CACHE[addr_cache_key(addr, chain_id)] = {**value, "_ts": time.time()}
 
 
 def addr_cache_merge(addr, chain_id, **updates):
     with ADDR_CACHE_LOCK:
         key = addr_cache_key(addr, chain_id)
-        merged = {**(ADDR_CACHE.get(key, {})), **updates}
+        old = ADDR_CACHE.get(key, {})
+        # 合并时刷新时间戳：本次刚拿到的字段是新的，不该被旧时间戳带着一起过期
+        merged = {**{k: v for k, v in old.items() if k != "_ts"}, **updates,
+                  "_ts": time.time()}
         ADDR_CACHE[key] = merged
-        return merged
+        return {k: v for k, v in merged.items() if k != "_ts"}
 
 
 def addr_cache_clear():
@@ -280,10 +331,94 @@ def addr_cache_clear():
         ADDR_CACHE.clear()
 
 
+# ===== 在途去重：同一"目标 + CA"同时只跑一次查询 =====
+# 只靠 60 秒结果缓存挡不住并发：查询要跑十几秒，DeBox 超时重试的第二条请求
+# 会在第一条还没写完缓存时就进来，两条都发消息 → 群里出现重复报告。
+INFLIGHT = set()
+INFLIGHT_LOCK = threading.Lock()
+
+
+def inflight_begin(key):
+    """抢占在途标记；已有人在查同一个目标同一币时返回 False。"""
+    with INFLIGHT_LOCK:
+        if key in INFLIGHT:
+            return False
+        INFLIGHT.add(key)
+        return True
+
+
+def inflight_end(key):
+    with INFLIGHT_LOCK:
+        INFLIGHT.discard(key)
+
+
+def inflight_clear():
+    with INFLIGHT_LOCK:
+        INFLIGHT.clear()
+
+
+# ===== 回复去重：同一目标同一 CA 短时间内只回一次 =====
+# 在途去重只能挡住"同时"，挡不住"第一次已经跑完、DeBox 30 秒后才重试"：
+# 那时结果已经进缓存，第二次请求会命中缓存再发一条 → 群里两条一样的报告。
+_REPLY_TS = {}
+_REPLY_LOCK = threading.Lock()
+
+
+def should_reply(target, ca_address):
+    """同一 (目标, CA) 在 REPLY_DEDUP_TTL 内只回复一次。target 为群/用户 ID。"""
+    key = (str(target), ca_address)
+    now = time.time()
+    with _REPLY_LOCK:
+        last = _REPLY_TS.get(key)
+        if last is not None and now - last < REPLY_DEDUP_TTL:
+            return False
+        _REPLY_TS[key] = now
+        if len(_REPLY_TS) > 5000:   # 顺手清理，避免长期运行无限增长
+            for k, ts in list(_REPLY_TS.items()):
+                if now - ts >= REPLY_DEDUP_TTL:
+                    del _REPLY_TS[k]
+        return True
+
+
+def reply_dedup_clear():
+    with _REPLY_LOCK:
+        _REPLY_TS.clear()
+
+
+def query_mode():
+    """返回 "async" 或 "sync"。
+
+    Serverless 上必须同步：响应返回后实例被冻结，后台线程拿不到 CPU，
+    用户永远等不到回复。长驻进程用异步：DeBox 侧 10~30 秒必超时，重试会重复推送。
+    """
+    if QUERY_MODE in ("async", "sync"):
+        return QUERY_MODE
+    if any(os.getenv(m) for m in SERVERLESS_ENV_MARKERS):
+        return "sync"
+    return "async"
+
+
 # ===== 工具函数 =====
 def now_bj():
     """北京时间（UTC+8）。"""
     return datetime.now(timezone(timedelta(hours=8)))
+
+
+def auth_ok(header_key, expected):
+    """常量时间比对请求头密钥；任何异常一律视为不通过（fail-closed）。
+
+    不能直接用 hmac.compare_digest(str, str)：HTTP 头按 latin-1 解码，
+    一个 0x80~0xFF 的字节就会变成非 ASCII 字符，compare_digest 直接抛
+    TypeError → 500。攻击者拿一个字节就能让接口吐堆栈、刷错误日志。
+    统一 encode 成 bytes 再比，既能比较，又保留常量时间特性。
+    """
+    if not expected or not header_key:
+        return False
+    try:
+        return hmac.compare_digest(str(header_key).encode("utf-8"),
+                                   str(expected).encode("utf-8"))
+    except Exception:
+        return False
 
 
 def fmt_money(n):
@@ -414,9 +549,23 @@ def set_blocklist(domains):
         CACHE.update({"domains": set(domains), "ts": time.time(), "loaded": True})
 
 
+_WARMED_PID = None
+
+
 def start_background_tasks():
     """启动时预热一次黑名单（daemon 线程，失败不影响主流程）。
-    之后的定时刷新由外部 cron / 云函数定时器调用 POST /refresh-blocklist 完成。"""
+    之后的定时刷新由外部 cron / 云函数定时器调用 POST /refresh-blocklist 完成。
+
+    幂等，但按 **PID** 判断而不是用 Event：gunicorn --preload 会先导入再 fork，
+    fork 会把 Event 的"已触发"状态一起复制过去，子进程里就再也不会预热了；
+    而 fork 只复制主线程，那条预热线程在子进程里根本不存在 ——
+    结果是每个 worker 的首条消息都要同步等 10~30 秒下载黑名单。
+    """
+    global _WARMED_PID
+    pid = os.getpid()
+    if _WARMED_PID == pid:
+        return
+    _WARMED_PID = pid
     threading.Thread(target=refresh_phishing_blocklist,
                      kwargs={"force": True}, daemon=True).start()
 
@@ -717,6 +866,12 @@ def check_domain_lookalike(domain):
     core = domain.split(".")[0]  # 取主域部分比对
     for brand in TRUSTED_BRAND_DOMAINS:
         brand_core = brand.split(".")[0]
+        # 官方域名出现在开头、后面还接别的域名（metamask.io.evil.com）：
+        # 正规站点不会有"官方域名.别人的域名"这种结构，这是经典钓法。
+        # 必须放在 core == brand_core 那条之前 —— 它的 core 也是 "metamask"，
+        # 会被"同名不同后缀不硬判"的规则提前 continue 掉。
+        if domain.startswith(brand + "."):
+            return brand
         # 完全相同或就是其子域 → 合法，跳过
         if domain == brand or domain.endswith("." + brand):
             continue
@@ -784,7 +939,7 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
     # 细化：前10里拆出合约地址（质押池/金库/交易所等）与个人地址（并行查询不拖慢回复）
     contract_pct = 0.0
     if holders and chain_id:
-        results = list(QUERY_EXECUTOR.map(lambda ap: classify_holder(ap[0], chain_id), holders))
+        results = list(SUB_EXECUTOR.map(lambda ap: classify_holder(ap[0], chain_id), holders))
         contract_pct = sum(pct for (addr, pct), r in zip(holders, results) if r["is_contract"])
         eoa_pct = top10_pct - contract_pct
     else:
@@ -884,7 +1039,7 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
                                      ("Owner", info.get("owner_address")))
                   if ((addr or "").lower()).startswith("0x")]
     if role_addrs:
-        flag_results = list(QUERY_EXECUTOR.map(
+        flag_results = list(SUB_EXECUTOR.map(
             lambda item: _fetch_malicious_flags(item[1], chain_id), role_addrs))
         for (role, ra), bad_flags in zip(role_addrs, flag_results):
             if bad_flags:
@@ -1111,7 +1266,7 @@ def get_token_full_info(ca_address):
         # 无行情（极早期）：并发探测所有支持的链，尽快拿到安全数据（最坏 35s → 约 5s）
         chain_id, chain_name, symbol = None, "", "未知"
         chain_ids = list(CHAIN_MAPPING.values())
-        probes = list(QUERY_EXECUTOR.map(
+        probes = list(SUB_EXECUTOR.map(
             lambda cid: (cid, goplus_evm(cid, ca_address)), chain_ids))
         for cid, info_probe in probes:
             if info_probe:
@@ -1325,24 +1480,77 @@ def handle_message(data):
     # 4. 查 CA 风险（先剔除 URL 再匹配，避免污染）
     ca_address = extract_valid_ca(message)
     if ca_address:
-        cached = query_cache_get(ca_address)
-        if cached is not None:
-            # 命中缓存也要回复：否则别的群/用户 60 秒内查同一个币会收不到任何消息
-            reply_text, markup = cached
-            _send(data, reply_text, markup)
-            record_user_activity(from_user_id)
-            return {"status": "ok", "cached": True}
+        run_query(data, ca_address)
+    return {"status": "ok"}
 
+
+def _do_query(data, ca_address):
+    """执行一次查询并回复。
+
+    缓存命中也要回复：否则别的群/用户在 60 秒内查同一个币会收不到任何消息。
+    但同一目标（群）在 REPLY_DEDUP_TTL 内只回一次 —— DeBox 超时重试进来的
+    第二次请求会命中缓存，不去重就会把同一份报告再推一遍。
+    """
+    target = data.get("group_id") or data.get("from_user_id") or "-"
+    if not should_reply(target, ca_address):
+        return
+
+    cached = query_cache_get(ca_address)
+    if cached is not None:
+        reply_text, markup = cached
+    else:
+        reply_text, markup = get_token_full_info(ca_address)
+        query_cache_set(ca_address, reply_text, markup)  # 成功才写缓存
+    _send(data, reply_text, markup)
+    record_user_activity(data.get("from_user_id"))
+
+
+def _safe_query(data, ca_address, key):
+    """线程池里跑的包装：异常不外抛（线程池里抛了没人接），但要让用户知道失败了。"""
+    try:
+        _do_query(data, ca_address)
+    except Exception as e:
+        print(f"[query] 查币任务异常: {e}")
         try:
-            reply_text, markup = get_token_full_info(ca_address)
-            query_cache_set(ca_address, reply_text, markup)  # 查询成功才写缓存
-            _send(data, reply_text, markup)
-            record_user_activity(from_user_id)
+            _send(data, "🐕 查询失败：上游接口暂时不可用，请稍后重试")
+        except Exception:
+            pass
+    finally:
+        inflight_end(key)
+
+
+def run_query(data, ca_address):
+    """按部署模式执行查询：async 丢线程池立即返回，sync 就地跑完。
+
+    在途去重按 (目标, CA)：DeBox 超时重试进来的第二条请求会被直接丢弃，
+    既不重复回复，也不会让 total_queries 多计一次。
+    """
+    target = data.get("group_id") or data.get("from_user_id") or "-"
+    key = (str(target), ca_address)
+    if not inflight_begin(key):
+        return False
+
+    if query_mode() == "sync":
+        try:
+            _do_query(data, ca_address)
         except Exception as e:
             print(f"[query] 查币任务异常: {e}")
-        return {"status": "ok"}
+            try:
+                _send(data, "🐕 查询失败：上游接口暂时不可用，请稍后重试")
+            except Exception:
+                pass
+        finally:
+            inflight_end(key)
+        return True
 
-    return {"status": "ok"}
+    try:
+        QUERY_EXECUTOR.submit(_safe_query, data, ca_address, key)
+    except Exception as e:
+        # 线程池已关闭（进程退出中）或提交失败：不能把在途标记永远挂在那里，
+        # 否则这个 CA 之后再也查不了。降级为就地执行，_safe_query 自己会释放标记。
+        print(f"[query] 线程池不可用，改为同步执行: {e}")
+        _safe_query(data, ca_address, key)
+    return True
 
 
 # ======================================================================
@@ -1353,12 +1561,23 @@ def handle_message(data):
 app = Flask(__name__)
 
 
+@app.before_request
+def _ensure_warm():
+    """首次请求兜底预热（幂等）。
+
+    gunicorn --preload 先导入再 fork，fork 只复制主线程 —— 导入时启动的预热
+    线程在 worker 里并不存在。这里补一次，否则每个 worker 的首条消息要等
+    10~30 秒下载黑名单才回复。
+    """
+    start_background_tasks()
+
+
 @app.route("/refresh-blocklist", methods=["GET", "POST"])
 def refresh_blocklist():
     """黑名单手动刷新接口（供外部 cron / 云函数定时器预热用）。
     同时支持 GET/POST：curl 与部分只支持 GET 的云平台定时器（如 Vercel Cron）都能触发。"""
     header_key = request.headers.get("X-API-KEY", "")
-    if not WEBHOOK_KEY or not hmac.compare_digest(header_key, WEBHOOK_KEY):
+    if not auth_ok(header_key, WEBHOOK_KEY):
         return jsonify({"error": "unauthorized"}), 401
     try:
         # 立即返回：45 万行黑名单下载可能耗时 10~30 秒，超过 Serverless 平台请求超时
@@ -1375,7 +1594,7 @@ def refresh_blocklist():
 def webhook():
     """DeBox Webhook 入口。鉴权 fail-closed：环境变量未配置时直接拒绝，避免误放行。"""
     header_key = request.headers.get("X-API-KEY", "")
-    if not WEBHOOK_KEY or not hmac.compare_digest(header_key, WEBHOOK_KEY):
+    if not auth_ok(header_key, WEBHOOK_KEY):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
