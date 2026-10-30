@@ -23,7 +23,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request
 import requests
@@ -81,11 +80,14 @@ IMPERSONATION_TOKENS = {
 # ===== 地址正则：同时支持 EVM 与 Solana =====
 # 0x 分支加负向前瞻 (?![a-fA-F0-9])：避免把 64 位裸交易 hash 的前 42 字符误当合约地址
 CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40}(?![a-fA-F0-9]))|([1-9A-HJ-NP-Za-km-z]{32,44})")
-URL_PATTERN = re.compile(r"https?://[^\s]+")
+# re.I：HTTPS:// 这种大写协议头也要认。不认的话 "HTTPS://x.com" 不会被当成链接，
+# 裸域名规则又会从 "-" 后面截出错片段（binance-verify.vip → verify.vip），直接漏报。
+URL_PATTERN = re.compile(r"https?://[^\s]+", re.I)
 # 裸域名（不带 http 前缀）：metamask-io.app、binance-verify.vip 这类
 # 只匹配 .常见TLD 结尾、至少两段的域名，避免把普通英文句子误判
+# 后顾里排除 "-"：否则从 "binance-verify.vip" 里会截出 "verify.vip" 这种伪域名
 DOMAIN_PATTERN = re.compile(
-    r"(?<![\w@.\/])((?:[a-zA-Z0-9][a-zA-Z0-9-]*\.)+"
+    r"(?<![\w@./-])((?:[a-zA-Z0-9][a-zA-Z0-9-]*\.)+"
     r"(?:com|net|org|io|app|xyz|vip|top|cc|me|pro|finance|site|online|info|biz|link|club|fun|"
     r"ltd|shop|store|tech|zone|page|dev|one|pw|tv|co|ai|cn|us|uk|jp|kr|de|fr|hk|tw|mo|asia|"
     r"mobi|gov|edu|id|my|sg|in|au))\b"
@@ -1177,23 +1179,44 @@ def _send(data, content, reply_markup=None):
         send_message("private", data["from_user_id"], content, reply_markup)
 
 
-MAX_DOMAINS_PER_MESSAGE = 5   # 一条消息最多检几个域名：防止有人塞 50 个链接刷爆接口
+MAX_DOMAINS_PER_MESSAGE = 50   # 一条消息最多看几个域名（防极端刷屏）
+MAX_REMOTE_CHECKS = 3          # 其中最多几个走 GoPlus（有网络成本，3s 超时）
+
+URL_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+HOST_CHARS_RE = re.compile(r"[a-zA-Z0-9._-]+")
+
+
+def _host_of(url):
+    """从一段 URL 里取出干净的 hostname。
+
+    不能直接用 urlparse().hostname：它会把后面的中文标点一起吞进去。
+    "https://scam.com，快领" → hostname 是 "scam.com，快领"，黑名单查不到，
+    等于白查一遍。这里按字符集截断，并顺手剥掉 userinfo 和端口。
+    """
+    rest = URL_SCHEME_RE.sub("", url)          # 去协议头（大小写都认）
+    rest = re.split(r"[/?#]", rest, 1)[0]      # 只留 authority 部分
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]          # 去 user:pw@
+    rest = rest.split(":")[0]                  # 去端口
+    m = HOST_CHARS_RE.match(rest)              # 中文标点/全角符号在这里被截断
+    return (m.group(0) if m else "").lower().strip(".")
 
 
 def _domains_of(message):
     """提取消息里所有待检测域名（去重、保持出现顺序）。
 
     原实现只取第一个链接：先放一个正常链接、再放钓鱼链接即可稳定绕过。
-    链接取 hostname（自动剥离 :端口 与 user:pw@），裸域名单独再扫一遍，
-    两者天然不重复 —— DOMAIN_PATTERN 的负向后顾排除了紧跟在 "/" 后的域名。
     """
     seen, out = set(), []
     for m in URL_PATTERN.finditer(message):
-        host = (urlparse(m.group()).hostname or "").lower().strip(".")
+        host = _host_of(m.group())
         if host and host not in seen:
             seen.add(host)
             out.append(host)
-    for m in DOMAIN_PATTERN.finditer(message):
+    # 裸域名：先把已识别的 URL 整段抹掉再扫，否则会从链接内部截出错片段
+    # （HTTPS://binance-verify.vip 曾被提取成 verify.vip）
+    cleaned = URL_PATTERN.sub(" ", message)
+    for m in DOMAIN_PATTERN.finditer(cleaned):
         dom = m.group(1).lower()
         if dom not in seen:
             seen.add(dom)
@@ -1201,24 +1224,30 @@ def _domains_of(message):
     return out[:MAX_DOMAINS_PER_MESSAGE]
 
 
-def check_phishing(domain):
-    """三层检测：本地黑名单 → 仿冒识别 → GoPlus 实时接口。命中返回来源描述，未命中返回 None。"""
-    source = None
-    # 第1层：本地黑名单（MetaMask + ScamSniffer，毫秒级）
+def check_phishing_local(domain):
+    """前两层：本地黑名单 + 仿冒识别。纯内存查表 + 纯计算，毫秒级、无网络成本，
+    所以可以对消息里的**每个**域名都跑一遍。"""
     if check_domain_in_blocklist(domain):
-        source = "MetaMask/ScamSniffer 安全库"
-    else:
-        # 第2层：仿冒域名识别（与主流站点高度相似）
-        lookalike = check_domain_lookalike(domain)
-        if lookalike:
-            source = f"仿冒域名检测（高度疑似 {lookalike} 的仿冒站点）"
-        else:
-            # 第3层：GoPlus 实时接口兜底
-            try:
-                if goplus_phishing_site(domain):
-                    source = "GoPlus 安全库"
-            except Exception:
-                pass  # GoPlus 超时不报警（宁可漏一条也不误报）
+        return "MetaMask/ScamSniffer 安全库"
+    lookalike = check_domain_lookalike(domain)
+    if lookalike:
+        return f"仿冒域名检测（高度疑似 {lookalike} 的仿冒站点）"
+    return None
+
+
+def check_phishing_remote(domain):
+    """第三层：GoPlus 实时接口。有网络成本（3s 超时），调用方必须限量。"""
+    try:
+        return "GoPlus 安全库" if goplus_phishing_site(domain) else None
+    except Exception:
+        return None  # 超时不报警（宁可漏一条也不误报）
+
+
+def check_phishing(domain, remote=True):
+    """单个域名的完整三层检测（保留给外部调用与测试）。"""
+    source = check_phishing_local(domain)
+    if source is None and remote:
+        source = check_phishing_remote(domain)
     return source
 
 
@@ -1268,11 +1297,16 @@ def handle_message(data):
     domains = _domains_of(message)
     if domains and group_id:
         allowed = ALLOWED_DOMAINS
-        hits = []
+        hits, remote_left = [], MAX_REMOTE_CHECKS
         for domain in domains:
             if any(domain == d or domain.endswith("." + d) for d in allowed):
                 continue
-            source = check_phishing(domain)
+            # 本地两层对每个域名都跑：没有网络成本，若在这里也限个数，
+            # 攻击者只要把钓鱼链接排到第 4 个（或塞 5 个正常链接垫在前面）就能绕过。
+            source = check_phishing_local(domain)
+            if source is None and remote_left > 0:
+                remote_left -= 1
+                source = check_phishing_remote(domain)
             if source:
                 hits.append((domain, source))
         if hits:
