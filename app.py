@@ -63,13 +63,14 @@ def _load_phishing_blocklist():
     return domains
 
 
-def _refresh_phishing_blocklist(force=False):
-    """加载/刷新黑名单。失败时保留旧缓存，绝不因数据源故障而漏报已确认的钓鱼站。"""
+def _refresh_phishing_blocklist(force=False, wait=False):
+    """加载/刷新黑名单。失败时保留旧缓存，绝不因数据源故障而漏报已确认的钓鱼站。
+    wait=True 时阻塞等待下载完成（供外部定时刷新接口使用）；否则非阻塞，请求线程快速返回旧缓存。"""
     now = time.time()
     with _phishing_lock:
         if not force and _phishing_list_cache["loaded"] and now - _phishing_list_cache["ts"] < PHISHING_LIST_TTL:
             return _phishing_list_cache["domains"]
-    if not _refresh_lock.acquire(blocking=False):
+    if not _refresh_lock.acquire(blocking=wait):
         # 已有线程在刷新，直接返回现有缓存（可能为空/稍旧，但绝不阻塞请求线程）
         with _phishing_lock:
             return _phishing_list_cache["domains"]
@@ -87,16 +88,6 @@ def _refresh_phishing_blocklist(force=False):
 
 def get_phishing_blocklist():
     return _refresh_phishing_blocklist(force=False)
-
-
-def _phishing_refresh_loop():
-    """后台定时刷新，把 45 万+ 行黑名单的下载放到后台线程，避免卡住请求。"""
-    while True:
-        time.sleep(PHISHING_LIST_TTL)
-        try:
-            _refresh_phishing_blocklist(force=True)
-        except Exception as e:
-            print(f"[phishing] 后台刷新异常: {e}")
 
 
 def check_domain_in_blocklist(domain):
@@ -175,7 +166,8 @@ def check_domain_lookalike(domain):
 
 
 # ===== 地址正则：同时支持 EVM 与 Solana =====
-CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40})|([1-9A-HJ-NP-Za-km-z]{32,44})")
+# 0x 分支加负向前瞻 (?![a-fA-F0-9])：避免把 64 位裸交易 hash 的前 42 字符误当合约地址
+CA_PATTERN = re.compile(r"(0x[a-fA-F0-9]{40}(?![a-fA-F0-9]))|([1-9A-HJ-NP-Za-km-z]{32,44})")
 URL_PATTERN = re.compile(r"https?://[^\s]+")
 # 裸域名（不带 http 前缀）：metamask-io.app、binance-verify.vip 这类
 # 只匹配 .常见TLD 结尾、至少两段的域名，避免把普通英文句子误判
@@ -398,22 +390,28 @@ _ADDR_CACHE_LOCK = threading.Lock()
 _ADDR_CACHE_MAX = 20000
 
 
-def _addr_cache_get(addr):
+def _addr_cache_key(addr, chain_id):
+    """缓存键含链 ID：同一地址在不同 EVM 链上的合约/EOA 状态可能不同。"""
+    return (str(chain_id), addr)
+
+
+def _addr_cache_get(addr, chain_id):
     with _ADDR_CACHE_LOCK:
-        return _ADDR_CACHE.get(addr)
+        return _ADDR_CACHE.get(_addr_cache_key(addr, chain_id))
 
 
-def _addr_cache_set(addr, value):
+def _addr_cache_set(addr, value, chain_id):
     with _ADDR_CACHE_LOCK:
         if len(_ADDR_CACHE) >= _ADDR_CACHE_MAX:
             _ADDR_CACHE.clear()
-        _ADDR_CACHE[addr] = value
+        _ADDR_CACHE[_addr_cache_key(addr, chain_id)] = value
 
 
-def _addr_cache_merge(addr, **updates):
+def _addr_cache_merge(addr, chain_id, **updates):
     with _ADDR_CACHE_LOCK:
-        merged = {**(_ADDR_CACHE.get(addr, {})), **updates}
-        _ADDR_CACHE[addr] = merged
+        key = _addr_cache_key(addr, chain_id)
+        merged = {**(_ADDR_CACHE.get(key, {})), **updates}
+        _ADDR_CACHE[key] = merged
         return merged
 
 
@@ -450,7 +448,7 @@ def classify_holder(addr, chain_id):
     addr = (addr or "").lower()
     if not addr.startswith("0x"):
         return {"is_contract": False}
-    cached = _addr_cache_get(addr)
+    cached = _addr_cache_get(addr, chain_id)
     if cached is not None:
         return cached
     try:
@@ -471,7 +469,7 @@ def classify_holder(addr, chain_id):
     except Exception as e:
         print(f"[query] address_security 异常: {e}")
         out = {"is_contract": False}  # 查不到时按个人地址处理，不放大风险
-    _addr_cache_set(addr, out)
+    _addr_cache_set(addr, out, chain_id)
     return out
 
 
@@ -615,7 +613,7 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
         ra = (role_addr or "").lower()
         if not ra.startswith("0x"):
             continue
-        cached = _addr_cache_get(ra) or {}
+        cached = _addr_cache_get(ra, chain_id) or {}
         if "flags" in cached:
             bad_flags = cached["flags"]
         else:
@@ -630,7 +628,7 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
                     bad_flags = [f for f in MALICIOUS_FLAGS if str(rinfo.get(f)) == "1"]
             except Exception:
                 bad_flags = []
-            _addr_cache_merge(ra, is_contract=cached.get("is_contract", False),
+            _addr_cache_merge(ra, chain_id, is_contract=cached.get("is_contract", False),
                               flags=bad_flags)
         if bad_flags:
             suspicious_roles.append(f"{role}涉黑")
@@ -772,10 +770,11 @@ def get_token_full_info(ca_address):
         # 详情页直达链接（DexScreener 交易对页）
         dex_page = best_pair.get("url") or dex_url
     else:
-        # 无行情（极早期）：遍历支持的链尝试拿到安全数据
+        # 无行情（极早期）：并发探测所有支持的链，尽快拿到安全数据（最坏 35s → 约 5s）
         chain_id, chain_name, symbol = None, "", "未知"
-        for cid in set(CHAIN_MAPPING.values()):
-            info_probe = goplus_evm(cid, ca_address)
+        chain_ids = list(CHAIN_MAPPING.values())
+        probes = list(_QUERY_EXECUTOR.map(lambda cid: (cid, goplus_evm(cid, ca_address)), chain_ids))
+        for cid, info_probe in probes:
             if info_probe:
                 chain_id = cid
                 chain_name = CHAIN_NAMES.get(cid, cid)
@@ -888,6 +887,23 @@ def extract_valid_ca(message):
     return None
 
 
+# ================= 黑名单手动刷新接口（供外部 cron / 云函数定时器预热用） =================
+# 同时支持 GET/POST：curl 与部分只支持 GET 的云平台定时器（如 Vercel Cron）都能触发
+@app.route("/refresh-blocklist", methods=["GET", "POST"])
+def refresh_blocklist():
+    header_key = request.headers.get("X-API-KEY", "")
+    if not WEBHOOK_KEY or not hmac.compare_digest(header_key, WEBHOOK_KEY):
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        domains = _refresh_phishing_blocklist(force=True, wait=True)
+        if not domains:
+            return jsonify({"status": "error", "error": "黑名单拉取失败（数据源不可用）"}), 502
+        return jsonify({"status": "ok", "domains": len(domains)}), 200
+    except Exception as e:
+        print(f"[phishing] 手动刷新异常: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 # ================= Webhook 路由 =================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -897,7 +913,12 @@ def webhook():
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
-    message = data.get("message_raw", data.get("message", ""))
+    if not isinstance(data, dict):
+        data = {}  # 非对象（如 JSON 数组）直接兜底，避免 .get() 抛异常
+    # message_raw 为空/缺失时回退到 message
+    message = data.get("message_raw") or data.get("message") or ""
+    if not isinstance(message, str):
+        message = str(message)  # 消息体非字符串（dict/list 等）时强转，避免 .lower() 抛异常
     group_id = data.get("group_id")
     from_user_id = data.get("from_user_id")
 
@@ -998,10 +1019,10 @@ def webhook():
         if ca_address:
             if _query_cache_is_fresh(ca_address):
                 return jsonify({"status": "ok", "cached": True}), 200
-            _query_cache_set(ca_address)
 
             try:
                 reply_text, markup = get_token_full_info(ca_address)
+                _query_cache_set(ca_address)  # 查询成功才写缓存，失败 60 秒内可重试
                 if group_id: send_message("group", group_id, reply_text, markup)
                 elif from_user_id: send_message("private", from_user_id, reply_text, markup)
                 record_user_activity(from_user_id)
@@ -1013,9 +1034,9 @@ def webhook():
 
 
 def start_background_tasks():
-    """启动后台线程（黑名单预热 + 定时刷新）。daemon 线程随进程退出自动回收。"""
+    """启动时预热一次黑名单（daemon 线程，失败不影响主流程）。
+    之后的定时刷新由外部 cron / 云函数定时器调用 POST /refresh-blocklist 完成。"""
     threading.Thread(target=_refresh_phishing_blocklist, kwargs={"force": True}, daemon=True).start()
-    threading.Thread(target=_phishing_refresh_loop, daemon=True).start()
 
 
 start_background_tasks()
