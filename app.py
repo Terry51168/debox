@@ -928,17 +928,22 @@ def classify_holder(addr, chain_id):
 # 零地址：renounceOwnership() 之后 owner 指向这里
 ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
+# GoPlus 这几个字段的含义全是"合约里有没有这个功能"，不是"现在有没有人能按"。
+# 项目方 renounce 之后，函数照样躺在字节码里、字段照样是 "1"，但没有任何地址
+# 能调用 —— 直接判致命会把大量已弃权的正常币误杀成"千万别碰"。
+# 实测：RAD 0xabb0ede…06ab 栽在 is_mintable；CZ人生 0xd0f2a86…bd04 栽在 is_blacklisted，
+# 两者的 owner() 都已经是 0x000…dead（链上核对过）。
+RENOUNCE_MUTED = {"改余额", "增发", "黑名单"}
+
 
 def ownership_renounced(info):
-    """所有权是否已彻底放弃：owner 为零地址、无隐藏 owner、且拿不回来。
+    """所有权是否已彻底放弃：owner 指向销毁地址、无隐藏 owner、且拿不回来。
 
-    GoPlus 的 is_mintable 只回答"合约里有没有铸币函数"，不看钥匙还在谁手里。
-    项目方放弃所有权后，mint 函数照样留在字节码里、is_mintable 照样是 "1"，
-    直接判致命会把大量已弃权的正常币误杀成"千万别碰"（实测 RAD/0xabb0ede…06ab）。
-
+    renounce 时 owner 常被发到 0x…dead 而非零地址，两者都算（BURN_ADDRESSES）。
     三者齐全才算真弃权；任何一项不确定（含字段缺失）都返回 False，保持从严。
     """
-    if str(info.get("owner_address") or "").strip().lower() != ZERO_ADDR:
+    owner = str(info.get("owner_address") or "").strip().lower()
+    if owner not in BURN_ADDRESSES:
         return False
     if str(info.get("hidden_owner") or "") == "1":
         return False
@@ -1080,15 +1085,17 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
             continue
         if str(val) == safe_when:
             continue
-        # 铸币函数还在，但所有权已彻底放弃 → 没人能调，不构成可被利用的风险。
-        # 不能只降级成"可控"：那样整枚干净的币会被标成"需留意"，
-        # 反而让人以为有问题（实测 RAD 就是这样被误标黄的）。
-        if name == "增发" and ownership_renounced(info):
+        # 权限型后门：owner 已彻底放弃时这些 onlyOwner 开关没人能按，
+        # 留着也不构成可被利用的风险（见 RENOUNCE_MUTED 注释里的两个实测案例）
+        if name in RENOUNCE_MUTED and ownership_renounced(info):
             continue
         fatal_items.append(name)
         risks.append(risk_label)
     for name, val, warn_label in warn_defs:
         if str(val) == "1":
+            # 暂停/白名单同样是 onlyOwner 开关，owner 已弃权就没人能按
+            if name in ("暂停", "白名单") and ownership_renounced(info):
+                continue
             warn_items.append(warn_label)
 
     # 自毁：同可控项逻辑，仅明确查到 "1" 时提示，缺失不进未知栏
