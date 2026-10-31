@@ -1080,9 +1080,10 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
             continue
         if str(val) == safe_when:
             continue
-        # 铸币函数还在，但所有权已彻底放弃 → 没人能调，降为可控提示而不是致命
+        # 铸币函数还在，但所有权已彻底放弃 → 没人能调，不构成可被利用的风险。
+        # 不能只降级成"可控"：那样整枚干净的币会被标成"需留意"，
+        # 反而让人以为有问题（实测 RAD 就是这样被误标黄的）。
         if name == "增发" and ownership_renounced(info):
-            warn_items.append("铸币权已放弃")
             continue
         fatal_items.append(name)
         risks.append(risk_label)
