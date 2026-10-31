@@ -925,6 +925,28 @@ def classify_holder(addr, chain_id):
     return out
 
 
+# 零地址：renounceOwnership() 之后 owner 指向这里
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+
+def ownership_renounced(info):
+    """所有权是否已彻底放弃：owner 为零地址、无隐藏 owner、且拿不回来。
+
+    GoPlus 的 is_mintable 只回答"合约里有没有铸币函数"，不看钥匙还在谁手里。
+    项目方放弃所有权后，mint 函数照样留在字节码里、is_mintable 照样是 "1"，
+    直接判致命会把大量已弃权的正常币误杀成"千万别碰"（实测 RAD/0xabb0ede…06ab）。
+
+    三者齐全才算真弃权；任何一项不确定（含字段缺失）都返回 False，保持从严。
+    """
+    if str(info.get("owner_address") or "").strip().lower() != ZERO_ADDR:
+        return False
+    if str(info.get("hidden_owner") or "") == "1":
+        return False
+    if str(info.get("can_take_back_ownership") or "") == "1":
+        return False
+    return True
+
+
 # ================= EVM 判定 =================
 def build_evm_lines(info, chain_id=None, ca_address=None):
     """根据 GoPlus 数据生成元信息条目、异常审计项、风险标签列表"""
@@ -1055,9 +1077,15 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
             continue
         if val is None or str(val) == "":
             unknown_items.append(name)
-        elif str(val) != safe_when:
-            fatal_items.append(name)
-            risks.append(risk_label)
+            continue
+        if str(val) == safe_when:
+            continue
+        # 铸币函数还在，但所有权已彻底放弃 → 没人能调，降为可控提示而不是致命
+        if name == "增发" and ownership_renounced(info):
+            warn_items.append("铸币权已放弃")
+            continue
+        fatal_items.append(name)
+        risks.append(risk_label)
     for name, val, warn_label in warn_defs:
         if str(val) == "1":
             warn_items.append(warn_label)
