@@ -882,13 +882,21 @@ def check_domain_lookalike(domain):
             continue
         dist = _levenshtein(core, brand_core)
         limit = 1 if len(brand_core) <= 8 else 2
+        # "少打一个字母"这种缩短型仿冒，只在品牌名够长时才认：
+        # 4~6 个字母的短品牌本身就是常见短词，少一个字母极容易撞上**另一个独立品牌**。
+        # 实测 ave.ai（AVE 行情平台，正规）被当成 aave.com 的仿冒报成
+        # "高危警告 · 请勿点击"，在群里非常尴尬。binance(7)→binanc 仍按老规则抓。
+        if len(core) < len(brand_core) and len(brand_core) <= 6:
+            dist = 99
         if dist <= limit and abs(len(core) - len(brand_core)) <= 2:
             return brand
         # 连字符/拼接仿冒：按分隔符拆词，品牌名是一个词，其余是典型骗子词汇
         # 如 metamask-io.app、uniswap-exchange.net、okx-earn.vip（纯拼接如 sushiswap 不误伤）
         tokens = re.split(r"[-_.]", core)
         if brand_core in tokens and len(tokens) >= 2 and all(
-            t == brand_core or t in IMPERSONATION_TOKENS or t.isdigit() for t in tokens
+            t == brand_core or t in IMPERSONATION_TOKENS or t.isdigit()
+            or re.fullmatch(r"v\d{1,2}", t)          # aave-v3.com：拿版本号当噱头
+            for t in tokens
         ):
             return brand
     return None
