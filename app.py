@@ -941,7 +941,21 @@ ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 # 能调用 —— 直接判致命会把大量已弃权的正常币误杀成"千万别碰"。
 # 实测：RAD 0xabb0ede…06ab 栽在 is_mintable；CZ人生 0xd0f2a86…bd04 栽在 is_blacklisted，
 # 两者的 owner() 都已经是 0x000…dead（链上核对过）。
-RENOUNCE_MUTED = {"改余额", "增发", "黑名单"}
+#
+# 但只有"开关型"权限可以这样豁免：开关没人按 = 等于不存在。
+# 「名单」（黑名单/白名单）不适用，见 RENOUNCE_DOWNGRADE。
+RENOUNCE_MUTED = {"改余额", "增发"}
+
+# 名单型机制：owner 弃权后仍然要提示，只是不再判死。
+#
+# 区别在哪：开关是布尔值，没人按就等于关着；名单是**状态集合**，弃权不会清空它。
+# 项目方在 renounce 之前把地址写进黑名单，弃权后这张名单永久生效、谁也解不开 ——
+# 「无人能按」对名单是加剧而不是豁免：本来还能求项目方解封，现在彻底没门。
+# 白名单更甚：名单固化 = 名单外地址永久无法交易，后来者买了也走不掉。
+#
+# 实测：ZEC 0x1960d60e…b77777，owner() 链上确认为零地址，但 is_blacklisted=1、
+# is_whitelisted=1、external_call=1，AVE 与钱包平台都判危险，我们此前判了纯绿。
+RENOUNCE_DOWNGRADE = {"黑名单": "黑名单无法解除"}
 
 
 def ownership_renounced(info):
@@ -1039,6 +1053,13 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
         ("暂停", info.get("transfer_pausable"), "暂停交易"),
         ("白名单", info.get("is_whitelisted"), "白名单限制"),
         ("代理", info.get("is_proxy"), "代理合约"),
+        ("滑点可改", info.get("slippage_modifiable"), "滑点可改"),
+        ("限额可改", info.get("anti_whale_modifiable"), "限额可改"),
+        # 转账路径里调外部合约：最隐蔽的一类。别人能做的判断（税率、貔貅模拟）
+        # 只覆盖卖出这一条路径，而外调可以按地址、按金额、按区块做分支，
+        # 也可以突然 revert 让所有人转不出去。代码写死在字节码里，owner 弃权照样跑。
+        # 实测：ZEC 0x1960d6…7777 该字段为 1，AVE 报"隐蔽空投扣减/零滑点外部兑换"。
+        ("外调", info.get("external_call"), "转账调外部合约"),
     ]
 
     fatal_items, warn_items, unknown_items = [], [], []
@@ -1083,6 +1104,9 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
         fatal_items.extend(suspicious_roles)
         risks.append("创建者有前科")
 
+    # owner 是否弃权只算一次：下面每个分支都要用，函数内部要过 4 个字段
+    renounced = ownership_renounced(info)
+
     for name, val, safe_when, risk_label in fatal_defs:
         # 主流锚定币的增发是官方锚定机制（充值 1:1 铸造），不算后门，直接跳过
         if name == "增发" and chain_id and ca_address \
@@ -1093,18 +1117,27 @@ def build_evm_lines(info, chain_id=None, ca_address=None):
             continue
         if str(val) == safe_when:
             continue
-        # 权限型后门：owner 已彻底放弃时这些 onlyOwner 开关没人能按，
+        # 开关型权限：owner 已彻底放弃时这些 onlyOwner 开关没人能按，
         # 留着也不构成可被利用的风险（见 RENOUNCE_MUTED 注释里的两个实测案例）
-        if name in RENOUNCE_MUTED and ownership_renounced(info):
+        if name in RENOUNCE_MUTED and renounced:
+            continue
+        # 名单型：弃权不会清空名单，只是把它冻结在当前状态，降级为提示而非消失
+        if name in RENOUNCE_DOWNGRADE and renounced:
+            warn_items.append(RENOUNCE_DOWNGRADE[name])
             continue
         fatal_items.append(name)
         risks.append(risk_label)
     for name, val, warn_label in warn_defs:
-        if str(val) == "1":
-            # 暂停/白名单同样是 onlyOwner 开关，owner 已弃权就没人能按
-            if name in ("暂停", "白名单") and ownership_renounced(info):
-                continue
-            warn_items.append(warn_label)
+        if str(val) != "1":
+            continue
+        # 纯开关型：弃权后没人能按，不提示
+        if name in ("暂停", "滑点可改", "限额可改") and renounced:
+            continue
+        # 白名单是名单型：弃权后名单固化，名单外地址永久无法交易 —— 比弃权前更糟
+        if name == "白名单" and renounced:
+            warn_items.append("白名单无法变更")
+            continue
+        warn_items.append(warn_label)
 
     # 自毁：同可控项逻辑，仅明确查到 "1" 时提示，缺失不进未知栏
     if str(info.get("self_destruct") or "") == "1":
